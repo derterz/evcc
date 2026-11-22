@@ -40,8 +40,19 @@ params:
       en: Work mode for Normal state
       de: Work mode für Normal-Modus
     help:
-      en: 0=manual, 1=anti-feed, 2=trade mode.
-      de: 0=manuell, 1=Eigenverbrauch, 2=AI-Optimierung.
+      en: 0=manual, 1=anti-feed, 2=trade mode, evcc=power set by evcc, balancing the soc with the other batteries.
+      de: 0=manuell, 1=Eigenverbrauch, 2=AI-Optimierung, evcc=Leistung wird von evcc gesteuert und gleicht den Ladestand mit den anderen Speichern aus.
+  - name: minpower
+    type: int
+    unit: W
+    default: 100
+    advanced: true
+    description:
+      en: Minimum power
+      de: Mindestleistung
+    help:
+      en: Only with work mode evcc. Below this power the inverter is stopped to save its standby losses.
+      de: Nur mit Work mode evcc. Unterhalb dieser Leistung wird der Wechselrichter gestoppt, um seinen Eigenverbrauch zu sparen.
 render: |
   type: custom
   {{- if eq .usage "pv" }}
@@ -133,6 +144,124 @@ render: |
       address: 32104 # Battery SOC (%)
       type: holding
       decode: uint16
+  {{- if eq (toString .work_mode_normal) "evcc" }}
+  chargePower:
+    source: sequence
+    set:
+    # Enable RS485 Control Mode, also after a device restart
+    - source: const
+      value: 21930
+      set:
+        source: modbus
+        {{- include "modbus" . | indent 6 }}
+        register:
+          address: 42000 # RS485 Control Mode = Enabled
+          type: writesingle
+          decode: uint16
+    - source: ifelse
+      if:
+        source: sequence
+        set:
+        - source: const
+          value: 1
+          set:
+            source: modbus
+            {{- include "modbus" . | indent 10 }}
+            register:
+              address: 42010 # Force Charge/Discharge = Charge
+              type: writesingle
+              decode: uint16
+        - source: modbus
+          {{- include "modbus" . | indent 8 }}
+          register:
+            address: 42020 # Forcible Charge Power
+            type: writesingle
+            decode: uint16
+      else:
+        source: const
+        value: 0
+        set:
+          source: modbus
+          {{- include "modbus" . | indent 8 }}
+          register:
+            address: 42010 # Force Charge/Discharge = Stop
+            type: writesingle
+            decode: uint16
+  dischargePower:
+    source: sequence
+    set:
+    # Enable RS485 Control Mode, also after a device restart
+    - source: const
+      value: 21930
+      set:
+        source: modbus
+        {{- include "modbus" . | indent 6 }}
+        register:
+          address: 42000 # RS485 Control Mode = Enabled
+          type: writesingle
+          decode: uint16
+    - source: ifelse
+      if:
+        source: sequence
+        set:
+        - source: const
+          value: 2
+          set:
+            source: modbus
+            {{- include "modbus" . | indent 10 }}
+            register:
+              address: 42010 # Force Charge/Discharge = Discharge
+              type: writesingle
+              decode: uint16
+        - source: modbus
+          {{- include "modbus" . | indent 8 }}
+          register:
+            address: 42021 # Forcible Discharge Power
+            type: writesingle
+            decode: uint16
+      else:
+        source: const
+        value: 0
+        set:
+          source: modbus
+          {{- include "modbus" . | indent 8 }}
+          register:
+            address: 42010 # Force Charge/Discharge = Stop
+            type: writesingle
+            decode: uint16
+  pvPower:
+    source: calc
+    add:
+    - source: modbus
+      {{- include "modbus" . | indent 4 }}
+      register:
+        address: 30037 # MPPT1 power (W)
+        type: holding
+        decode: uint16
+      scale: 0.1
+    - source: modbus
+      {{- include "modbus" . | indent 4 }}
+      register:
+        address: 30038 # MPPT2 power (W)
+        type: holding
+        decode: uint16
+      scale: 0.1
+    - source: modbus
+      {{- include "modbus" . | indent 4 }}
+      register:
+        address: 30039 # MPPT3 power (W)
+        type: holding
+        decode: uint16
+      scale: 0.1
+    - source: modbus
+      {{- include "modbus" . | indent 4 }}
+      register:
+        address: 30040 # MPPT4 power (W)
+        type: holding
+        decode: uint16
+      scale: 0.1
+  minPower: {{ .minpower }}
+  {{- end }}
   {{- include "marstek-batterymode" . }}
   {{- include "battery-params" . }}
   {{- end }}

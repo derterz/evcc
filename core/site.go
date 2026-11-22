@@ -70,6 +70,8 @@ type Site struct {
 	Meters        MetersConfig `mapstructure:"meters"`        // Meter references
 	CurtailersRef []string     `mapstructure:"curtailers"`    // Curtailment device references
 
+	BatteryDispatchReserve float64 `mapstructure:"batteryDispatchReserve"` // home load in W left to self-regulating batteries
+
 	// meters
 	circuit        api.Circuit                // Circuit
 	hems           api.HEMS                   // HEMS (set by configureHEMS at boot)
@@ -120,6 +122,7 @@ type Site struct {
 	batteryModeExternal      api.BatteryMode            // Battery mode (external, runtime only, not persisted)
 	batteryModeExternalTimer time.Time                  // Battery mode timer for external control
 	batteryModeApplied       map[string]api.BatteryMode // Battery mode last applied per battery meter
+	homePowerWindow          []timedPower               // Home power history for battery dispatch
 
 	optimizer optimizerState // optimizer runs, cached results and suggestions
 
@@ -1391,6 +1394,7 @@ func (site *Site) update(lp updater) {
 	site.publish(keys.BatteryGridDischargeActive, batteryGridDischargeActive)
 
 	site.updateBatteryMode(batteryGridChargeActive, batteryGridDischargeActive, rate)
+	site.dispatchBatteries()
 
 	// re-evaluate against the updated loadpoint state
 	site.publishSuggestions()
@@ -1420,6 +1424,7 @@ func (site *Site) updatePower(lp updater, state siteState, totalChargePower floa
 	homePower := state.gridPower + max(0, state.pvPower) + state.battery.Power - totalChargePower
 	homePower = max(homePower, 0)
 	site.publish(keys.HomePower, homePower)
+	site.recordHomePower(time.Now(), homePower)
 
 	if homePower > 0 {
 		if err := site.collectors[metrics.Home].AddEnergy(nil, nil, homePower); err != nil {

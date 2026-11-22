@@ -89,6 +89,12 @@ type BatteryController interface {
 	SetBatteryMode(BatteryMode) error
 }
 
+// BatteryPowerController sets the battery power in W, positive = discharge.
+// Like the meter's power it is measured at the battery, a device with its own PV adds that on the AC side.
+type BatteryPowerController interface {
+	SetBatteryPower(power float64) error
+}
+
 // Charger provides current charging status and enable/disable charging
 type Charger interface {
 	ChargeState
