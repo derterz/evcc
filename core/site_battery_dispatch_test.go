@@ -133,6 +133,19 @@ func TestDispatchBatteryPower(t *testing.T) {
 			[]*float64{nil, new(300.0)},
 		},
 		{
+			"missing capacity: equal weights",
+			// unweighted the marstek would be 300 with the kostal at 10 kWh
+			[]dispatchBattery{{soc: new(55.0), minSoc: 10, maxSoc: 100, power: 900}, marstek(55, 0, api.BatteryNormal)},
+			1000,
+			[]*float64{nil, new(450.0)},
+		},
+		{
+			"missing capacity: still balanced against the self-regulating battery",
+			[]dispatchBattery{{soc: new(50.0), minSoc: 10, maxSoc: 100, power: 900}, marstek(65, 0, api.BatteryNormal)},
+			1000,
+			[]*float64{nil, new(800.0)}, // 900 capped at max discharge
+		},
+		{
 			"missing soc: not dispatched",
 			[]dispatchBattery{kostal(55, 900), {controlled: true, mode: api.BatteryNormal, capacity: 5}},
 			1000,

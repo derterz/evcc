@@ -40,13 +40,6 @@ func (b dispatchBattery) usable() float64 {
 	return (*b.soc - lo) / (hi - lo)
 }
 
-func (b dispatchBattery) weight() float64 {
-	if b.capacity > 0 {
-		return b.capacity
-	}
-	return 1
-}
-
 // dispatchBatteryPower distributes the current net battery power across the controlled batteries.
 // The self-regulating batteries take the remainder. headroom caps the total discharge of the controlled
 // batteries, since the self-regulating inverter cannot absorb their export.
@@ -54,12 +47,21 @@ func (b dispatchBattery) weight() float64 {
 func dispatchBatteryPower(bb []dispatchBattery, headroom float64) []*float64 {
 	res := make([]*float64, len(bb))
 
+	// like the site soc, weigh by capacity only if all capacities are known
+	weighted := !slices.ContainsFunc(bb, func(b dispatchBattery) bool { return b.capacity <= 0 })
+	weight := func(b dispatchBattery) float64 {
+		if weighted {
+			return b.capacity
+		}
+		return 1
+	}
+
 	var net, totalWeight, usableAcc float64
 	for _, b := range bb {
 		net += b.power
 		if b.soc != nil {
-			totalWeight += b.weight()
-			usableAcc += b.usable() * b.weight()
+			totalWeight += weight(b)
+			usableAcc += b.usable() * weight(b)
 		}
 	}
 	if totalWeight == 0 {
@@ -82,7 +84,7 @@ func dispatchBatteryPower(bb []dispatchBattery, headroom float64) []*float64 {
 		balance := max(-1, min(1, (u-mean)/dispatchBalanceSpread))
 
 		// fair share of the net power, shifted towards the battery further from the mean
-		p := net * b.weight() / totalWeight
+		p := net * weight(b) / totalWeight
 		if net >= 0 {
 			p *= 1 + balance
 		} else {
