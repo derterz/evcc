@@ -29,6 +29,7 @@ type dispatchBattery struct {
 	capacity     float64 // kWh, 0 = unknown
 	maxCharge    float64 // W, 0 = unlimited
 	maxDischarge float64 // W, 0 = unlimited
+	minPower     float64 // W, the device stops below
 }
 
 // usable returns the soc as fraction of the usable range between min and max soc
@@ -69,7 +70,6 @@ func dispatchBatteryPower(bb []dispatchBattery, headroom float64) []*float64 {
 	}
 	mean := usableAcc / totalWeight
 
-	var discharge float64
 	for i, b := range bb {
 		if !b.controlled || b.soc == nil {
 			continue
@@ -104,20 +104,55 @@ func dispatchBatteryPower(bb []dispatchBattery, headroom float64) []*float64 {
 			p = min(p, b.maxDischarge)
 		}
 
-		discharge += max(0, p)
+		// too small to run the inverter, the self-regulating batteries take it
+		if math.Abs(p) < b.minPower {
+			p = 0
+		}
+
 		res[i] = new(p)
 	}
 
-	// scale discharge down to the headroom
-	if headroom = max(0, headroom); discharge > headroom {
-		for _, p := range res {
-			if p != nil && *p > 0 {
-				*p *= headroom / discharge
-			}
+	limitDischarge(bb, res, max(0, headroom))
+
+	return res
+}
+
+// limitDischarge scales the discharging batteries down to the headroom. A battery pushed below its
+// min power is stopped and the headroom is shared among the remaining ones.
+func limitDischarge(bb []dispatchBattery, res []*float64, headroom float64) {
+	var active []int
+	for i, p := range res {
+		if p != nil && *p > 0 {
+			active = append(active, i)
 		}
 	}
 
-	return res
+	for len(active) > 0 {
+		var sum float64
+		for _, i := range active {
+			sum += *res[i]
+		}
+
+		scale := min(1, headroom/sum)
+
+		// stop the smallest battery that would fall below its min power and retry, ties stop the last one
+		drop := -1
+		for k, i := range active {
+			if *res[i]*scale < bb[i].minPower && (drop < 0 || *res[i] <= *res[active[drop]]) {
+				drop = k
+			}
+		}
+
+		if drop < 0 {
+			for _, i := range active {
+				*res[i] *= scale
+			}
+			return
+		}
+
+		*res[active[drop]] = 0
+		active = slices.Delete(active, drop, drop+1)
+	}
 }
 
 type timedPower struct {
@@ -181,6 +216,8 @@ func (site *Site) dispatchBatteries() {
 			if b.mode == api.BatteryUnknown {
 				b.mode = site.GetBatteryMode()
 			}
+
+			b.minPower = ctrl.MinBatteryPower()
 
 			if bpl, ok := api.Cap[api.BatteryPowerLimiter](meter); ok {
 				if c, d, err := bpl.GetPowerLimits(); err == nil {

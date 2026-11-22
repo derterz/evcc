@@ -17,6 +17,11 @@ func TestDispatchBatteryPower(t *testing.T) {
 		return dispatchBattery{controlled: true, mode: mode, soc: new(soc), minSoc: 10, maxSoc: 100, capacity: 5, power: power, maxCharge: 1500, maxDischarge: 800}
 	}
 
+	minPower := func(b dispatchBattery, p float64) dispatchBattery {
+		b.minPower = p
+		return b
+	}
+
 	for _, tc := range []struct {
 		name     string
 		bb       []dispatchBattery
@@ -157,6 +162,44 @@ func TestDispatchBatteryPower(t *testing.T) {
 			600,
 			// unconstrained 750 each, capped at 800, scaled to 600 total
 			[]*float64{nil, new(300.0), new(300.0)},
+		},
+		{
+			"below min power: stopped",
+			[]dispatchBattery{kostal(55, 200), minPower(marstek(55, 0, api.BatteryNormal), 100)},
+			1000,
+			[]*float64{nil, new(0.0)},
+		},
+		{
+			"charge below min power: stopped",
+			[]dispatchBattery{kostal(55, -200), minPower(marstek(55, 0, api.BatteryNormal), 100)},
+			1000,
+			[]*float64{nil, new(0.0)},
+		},
+		{
+			"headroom below min power: stopped",
+			[]dispatchBattery{kostal(50, 900), minPower(marstek(65, 0, api.BatteryNormal), 100)},
+			80,
+			[]*float64{nil, new(0.0)},
+		},
+		{
+			"headroom goes to the batteries that run",
+			// scaled to 75 each both would stop, the last one is stopped and the other takes the full headroom
+			[]dispatchBattery{kostal(50, 1500), minPower(marstek(65, 0, api.BatteryNormal), 100), minPower(marstek(65, 0, api.BatteryNormal), 100)},
+			150,
+			[]*float64{nil, new(150.0), new(0.0)},
+		},
+		{
+			"stopped target does not reduce the others",
+			// the second marstek targets 75 and stops before the headroom is shared
+			[]dispatchBattery{kostal(55, 1150), minPower(marstek(64, 0, api.BatteryNormal), 100), minPower(marstek(50, 0, api.BatteryNormal), 100)},
+			500,
+			[]*float64{nil, new(500.0), new(0.0)},
+		},
+		{
+			"smallest battery stopped first",
+			[]dispatchBattery{kostal(55, 2000), minPower(marstek(64, 0, api.BatteryNormal), 100), minPower(marstek(52, 0, api.BatteryNormal), 100)},
+			400,
+			[]*float64{nil, new(400.0), new(0.0)},
 		},
 		{
 			"three batteries: each balanced towards the mean",

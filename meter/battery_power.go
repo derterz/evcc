@@ -16,34 +16,35 @@ type batteryPowerCtx struct {
 	MinPower       float64        // AC setpoints below are sent as stop to save inverter standby losses
 }
 
-// Controller returns the battery power setter, nil if not configured.
+// Controller returns the min power getter and battery power setter, nil if not configured.
 // limits are the AC power limits used for clamping, may be nil.
-func (cc *batteryPowerCtx) Controller(ctx context.Context, limits func() (float64, float64, error)) (func(float64) error, error) {
+func (cc *batteryPowerCtx) Controller(ctx context.Context, limits func() (float64, float64, error)) (func() float64, func(float64) error, error) {
 	if cc.ChargePower == nil && cc.DischargePower == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if cc.ChargePower == nil || cc.DischargePower == nil {
-		return nil, fmt.Errorf("battery power: chargePower and dischargePower must both be configured")
+		return nil, nil, fmt.Errorf("battery power: chargePower and dischargePower must both be configured")
 	}
 
 	chargeS, err := cc.ChargePower.IntSetter(ctx, "chargePower")
 	if err != nil {
-		return nil, fmt.Errorf("battery charge power: %w", err)
+		return nil, nil, fmt.Errorf("battery charge power: %w", err)
 	}
 
 	dischargeS, err := cc.DischargePower.IntSetter(ctx, "dischargePower")
 	if err != nil {
-		return nil, fmt.Errorf("battery discharge power: %w", err)
+		return nil, nil, fmt.Errorf("battery discharge power: %w", err)
 	}
 
 	pvG, err := cc.PvPower.FloatGetter(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("battery pv power: %w", err)
+		return nil, nil, fmt.Errorf("battery pv power: %w", err)
 	}
 
 	minPower := cc.MinPower
+	minG := func() float64 { return minPower }
 
-	return func(power float64) error {
+	return minG, func(power float64) error {
 		var pv, maxCharge, maxDischarge float64
 
 		if pvG != nil {

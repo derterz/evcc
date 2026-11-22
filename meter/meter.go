@@ -95,11 +95,11 @@ func NewConfigurableFromConfig(ctx context.Context, other map[string]any) (api.M
 		implement.May(m, implement.BatterySocLimiter(socLimiter))
 		implement.May(m, implement.BatteryPowerLimiter(powerLimiter))
 
-		powerS, err := cc.batteryPowerCtx.Controller(ctx, powerLimiter)
+		minPowerG, powerS, err := cc.batteryPowerCtx.Controller(ctx, powerLimiter)
 		if err != nil {
 			return nil, err
 		}
-		implement.May(m, implement.BatteryPowerController(powerS))
+		implement.May(m, implement.BatteryPowerController(minPowerG, powerS))
 
 		// limitSoc expresses normal/holddischarge/charge through the reserve soc (holddischarge uses the live soc),
 		// batteryMode switches the device's operating mode. Configured together the limit is written first.

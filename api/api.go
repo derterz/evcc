@@ -93,6 +93,7 @@ type BatteryController interface {
 // Like the meter's power it is measured at the battery, a device with its own PV adds that on the AC side.
 type BatteryPowerController interface {
 	SetBatteryPower(power float64) error
+	MinBatteryPower() float64 // below this the device stops instead
 }
 
 // Charger provides current charging status and enable/disable charging
