@@ -1,6 +1,7 @@
 package core
 
 import (
+	"cmp"
 	"errors"
 	"math"
 	"slices"
@@ -16,6 +17,8 @@ const (
 	dispatchPercentile = 0.1
 	// dispatchBalanceSpread is the usable soc difference at which balancing reaches full effect
 	dispatchBalanceSpread = 0.1
+	// dispatchSwitchSpread is the usable soc lead another battery needs to take over from a running one
+	dispatchSwitchSpread = 0.05
 )
 
 // dispatchBattery is one battery's input to the power dispatch
@@ -30,6 +33,7 @@ type dispatchBattery struct {
 	maxCharge    float64 // W, 0 = unlimited
 	maxDischarge float64 // W, 0 = unlimited
 	minPower     float64 // W, the device stops below
+	setpoint     float64 // W, last setpoint applied
 }
 
 // usable returns the soc as fraction of the usable range between min and max soc
@@ -41,9 +45,38 @@ func (b dispatchBattery) usable() float64 {
 	return (*b.soc - lo) / (hi - lo)
 }
 
-// dispatchBatteryPower distributes the current net battery power across the controlled batteries.
-// The self-regulating batteries take the remainder. headroom caps the total discharge of the controlled
-// batteries, since the self-regulating inverter cannot absorb their export.
+// allows returns if the mode and soc allow the battery to discharge or charge
+func (b dispatchBattery) allows(discharge bool) bool {
+	if discharge {
+		return b.mode != api.BatteryHoldDischarge && b.usable() > 0
+	}
+	return b.mode != api.BatteryHoldCharge && b.usable() < 1
+}
+
+// maxPower returns the power limit in the given direction, 0 = unlimited
+func (b dispatchBattery) maxPower(discharge bool) float64 {
+	if discharge {
+		return b.maxDischarge
+	}
+	return b.maxCharge
+}
+
+// priority orders the batteries to fill: fullest first for discharge, emptiest first for charge.
+// A running battery keeps its place until another leads by dispatchSwitchSpread.
+func (b dispatchBattery) priority(discharge bool) float64 {
+	prio := b.usable()
+	if !discharge {
+		prio = -prio
+	}
+	if discharge && b.setpoint > 0 || !discharge && b.setpoint < 0 {
+		prio += dispatchSwitchSpread
+	}
+	return prio
+}
+
+// dispatchBatteryPower determines the share of the net battery power the controlled batteries take
+// together and fills it into as few of them as possible. The self-regulating batteries take the
+// remainder. headroom caps the discharge, since the self-regulating inverter cannot absorb export.
 // Returns the setpoint per battery, nil for batteries that are not dispatched.
 func dispatchBatteryPower(bb []dispatchBattery, headroom float64) []*float64 {
 	res := make([]*float64, len(bb))
@@ -69,7 +102,11 @@ func dispatchBatteryPower(bb []dispatchBattery, headroom float64) []*float64 {
 		return res
 	}
 	mean := usableAcc / totalWeight
+	discharge := net >= 0
 
+	// the controlled batteries' share: each battery's fair share shifted by its distance from the mean
+	var total float64
+	var candidates []int
 	for i, b := range bb {
 		if !b.controlled || b.soc == nil {
 			continue
@@ -80,79 +117,47 @@ func dispatchBatteryPower(bb []dispatchBattery, headroom float64) []*float64 {
 			continue
 		}
 
-		u := b.usable()
-		balance := max(-1, min(1, (u-mean)/dispatchBalanceSpread))
-
-		// fair share of the net power, shifted towards the battery further from the mean
-		p := net * weight(b) / totalWeight
-		if net >= 0 {
-			p *= 1 + balance
-		} else {
-			p *= 1 - balance
+		res[i] = new(0.0)
+		if !b.allows(discharge) {
+			continue
 		}
 
-		if b.mode == api.BatteryHoldDischarge || u <= 0 {
-			p = min(p, 0)
-		}
-		if b.mode == api.BatteryHoldCharge || u >= 1 {
-			p = max(p, 0)
-		}
-		if b.maxCharge > 0 {
-			p = max(p, -b.maxCharge)
-		}
-		if b.maxDischarge > 0 {
-			p = min(p, b.maxDischarge)
+		balance := max(-1, min(1, (b.usable()-mean)/dispatchBalanceSpread))
+		if !discharge {
+			balance = -balance
 		}
 
-		// too small to run the inverter, the self-regulating batteries take it
-		if math.Abs(p) < b.minPower {
-			p = 0
-		}
-
-		res[i] = new(p)
+		total += math.Abs(net) * weight(b) / totalWeight * (1 + balance)
+		candidates = append(candidates, i)
 	}
 
-	limitDischarge(bb, res, max(0, headroom))
+	if discharge {
+		total = min(total, max(0, headroom))
+	}
+
+	slices.SortStableFunc(candidates, func(i, j int) int {
+		return cmp.Compare(bb[j].priority(discharge), bb[i].priority(discharge))
+	})
+
+	for _, i := range candidates {
+		p := total
+		if limit := bb[i].maxPower(discharge); limit > 0 {
+			p = min(p, limit)
+		}
+
+		// too small to run this inverter, a later one or the self-regulating batteries take it
+		if p < bb[i].minPower || p <= 0 {
+			continue
+		}
+
+		total -= p
+		if !discharge {
+			p = -p
+		}
+		*res[i] = p
+	}
 
 	return res
-}
-
-// limitDischarge scales the discharging batteries down to the headroom. A battery pushed below its
-// min power is stopped and the headroom is shared among the remaining ones.
-func limitDischarge(bb []dispatchBattery, res []*float64, headroom float64) {
-	var active []int
-	for i, p := range res {
-		if p != nil && *p > 0 {
-			active = append(active, i)
-		}
-	}
-
-	for len(active) > 0 {
-		var sum float64
-		for _, i := range active {
-			sum += *res[i]
-		}
-
-		scale := min(1, headroom/sum)
-
-		// stop the smallest battery that would fall below its min power and retry, ties stop the last one
-		drop := -1
-		for k, i := range active {
-			if *res[i]*scale < bb[i].minPower && (drop < 0 || *res[i] <= *res[active[drop]]) {
-				drop = k
-			}
-		}
-
-		if drop < 0 {
-			for _, i := range active {
-				*res[i] *= scale
-			}
-			return
-		}
-
-		*res[active[drop]] = 0
-		active = slices.Delete(active, drop, drop+1)
-	}
 }
 
 type timedPower struct {
@@ -218,6 +223,7 @@ func (site *Site) dispatchBatteries() {
 			}
 
 			b.minPower = ctrl.MinBatteryPower()
+			b.setpoint = site.batterySetpoints[dev.Config().Name]
 
 			if bpl, ok := api.Cap[api.BatteryPowerLimiter](meter); ok {
 				if c, d, err := bpl.GetPowerLimits(); err == nil {
@@ -247,6 +253,11 @@ func (site *Site) dispatchBatteries() {
 			}
 			continue
 		}
+
+		if site.batterySetpoints == nil {
+			site.batterySetpoints = make(map[string]float64)
+		}
+		site.batterySetpoints[dev.Config().Name] = *p
 
 		site.log.DEBUG.Printf("battery %s power setpoint: %.0fW (headroom %.0fW)", deviceTitleOrName(dev), *p, headroom)
 	}

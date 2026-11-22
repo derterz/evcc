@@ -123,6 +123,7 @@ type Site struct {
 	batteryModeExternalTimer time.Time                  // Battery mode timer for external control
 	batteryModeApplied       map[string]api.BatteryMode // Battery mode last applied per battery meter
 	homePowerWindow          []timedPower               // Home power history for battery dispatch
+	batterySetpoints         map[string]float64         // Battery power setpoint last applied per battery meter
 
 	optimizer optimizerState // optimizer runs, cached results and suggestions
 

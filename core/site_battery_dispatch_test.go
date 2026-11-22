@@ -21,6 +21,10 @@ func TestDispatchBatteryPower(t *testing.T) {
 		b.minPower = p
 		return b
 	}
+	setpoint := func(b dispatchBattery, p float64) dispatchBattery {
+		b.setpoint = p
+		return b
+	}
 
 	for _, tc := range []struct {
 		name     string
@@ -157,11 +161,10 @@ func TestDispatchBatteryPower(t *testing.T) {
 			[]*float64{nil, nil},
 		},
 		{
-			"three batteries: headroom shared proportionally",
+			"three batteries: headroom filled into one",
 			[]dispatchBattery{kostal(50, 1500), marstek(65, 0, api.BatteryNormal), marstek(65, 0, api.BatteryNormal)},
 			600,
-			// unconstrained 750 each, capped at 800, scaled to 600 total
-			[]*float64{nil, new(300.0), new(300.0)},
+			[]*float64{nil, new(600.0), new(0.0)},
 		},
 		{
 			"below min power: stopped",
@@ -202,11 +205,53 @@ func TestDispatchBatteryPower(t *testing.T) {
 			[]*float64{nil, new(400.0), new(0.0)},
 		},
 		{
-			"three batteries: each balanced towards the mean",
-			// mean usable 0.5, marstek 1 at +0.1, marstek 2 at -0.1
+			"three batteries: overflow beyond max power to the next",
+			// mean usable 0.5, the fuller marstek's share of 1000 exceeds its max discharge
 			[]dispatchBattery{kostal(55, 2000), marstek(64, 0, api.BatteryNormal), marstek(46, 0, api.BatteryNormal)},
 			2000,
-			[]*float64{nil, new(800.0), new(0.0)}, // 1000 capped at max discharge
+			[]*float64{nil, new(800.0), new(200.0)},
+		},
+		{
+			"three batteries: equal soc consolidated into one",
+			[]dispatchBattery{kostal(55, 1200), minPower(marstek(55, 0, api.BatteryNormal), 100), minPower(marstek(55, 0, api.BatteryNormal), 100)},
+			1000,
+			[]*float64{nil, new(600.0), new(0.0)},
+		},
+		{
+			"three batteries: fullest discharges",
+			[]dispatchBattery{kostal(55, 1200), marstek(54, 0, api.BatteryNormal), marstek(56, 0, api.BatteryNormal)},
+			1000,
+			[]*float64{nil, new(0.0), new(600.0)},
+		},
+		{
+			"three batteries: emptiest charges",
+			[]dispatchBattery{kostal(55, -1200), marstek(54, 0, api.BatteryNormal), marstek(56, 0, api.BatteryNormal)},
+			1000,
+			[]*float64{nil, new(-600.0), new(0.0)},
+		},
+		{
+			"three batteries: running battery kept within switch spread",
+			[]dispatchBattery{kostal(55, 1200), setpoint(marstek(54, 0, api.BatteryNormal), 600), marstek(57, 0, api.BatteryNormal)},
+			1000,
+			[]*float64{nil, new(617.0), new(0.0)}, // shares 258 + 358
+		},
+		{
+			"three batteries: switched over beyond switch spread",
+			[]dispatchBattery{kostal(55, 1200), setpoint(marstek(52, 0, api.BatteryNormal), 600), marstek(58, 0, api.BatteryNormal)},
+			1000,
+			[]*float64{nil, new(0.0), new(600.0)},
+		},
+		{
+			"three batteries: running charge does not hold discharge",
+			[]dispatchBattery{kostal(55, 1200), setpoint(marstek(54, 0, api.BatteryNormal), -600), marstek(56, 0, api.BatteryNormal)},
+			1000,
+			[]*float64{nil, new(0.0), new(600.0)},
+		},
+		{
+			"three batteries: held battery skipped",
+			[]dispatchBattery{kostal(55, 1200), marstek(60, 0, api.BatteryHoldDischarge), marstek(55, 0, api.BatteryNormal)},
+			1000,
+			[]*float64{nil, new(0.0), new(258.0)}, // the held battery's share goes to the kostal
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
