@@ -70,7 +70,7 @@ type Site struct {
 	Meters        MetersConfig `mapstructure:"meters"`        // Meter references
 	CurtailersRef []string     `mapstructure:"curtailers"`    // Curtailment device references
 
-	BatteryDispatchReserve float64 `mapstructure:"batteryDispatchReserve"` // home load in W left to self-regulating batteries
+	BatteryDispatchReserve float64 `mapstructure:"batteryDispatchReserve"` // demand in W left to self-regulating batteries for regulation
 
 	// meters
 	circuit        api.Circuit                // Circuit
@@ -122,7 +122,7 @@ type Site struct {
 	batteryModeExternal      api.BatteryMode            // Battery mode (external, runtime only, not persisted)
 	batteryModeExternalTimer time.Time                  // Battery mode timer for external control
 	batteryModeApplied       map[string]api.BatteryMode // Battery mode last applied per battery meter
-	homePowerWindow          []timedPower               // Home power history for battery dispatch
+	demandWindow             []timedPower               // Demand history for battery dispatch
 	batterySetpoints         map[string]float64         // Battery power setpoint last applied per battery meter
 
 	optimizer optimizerState // optimizer runs, cached results and suggestions
@@ -1425,7 +1425,8 @@ func (site *Site) updatePower(lp updater, state siteState, totalChargePower floa
 	homePower := state.gridPower + max(0, state.pvPower) + state.battery.Power - totalChargePower
 	homePower = max(homePower, 0)
 	site.publish(keys.HomePower, homePower)
-	site.recordHomePower(time.Now(), homePower)
+	// what the batteries cover together, independent of how it is currently split between them
+	site.recordDemand(time.Now(), homePower+totalChargePower-max(0, state.pvPower))
 
 	if homePower > 0 {
 		if err := site.collectors[metrics.Home].AddEnergy(nil, nil, homePower); err != nil {

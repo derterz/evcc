@@ -11,9 +11,9 @@ import (
 )
 
 const (
-	// dispatchWindow is the home power history the discharging headroom is derived from
+	// dispatchWindow is the demand history the dispatched power is derived from
 	dispatchWindow = 5 * time.Minute
-	// dispatchPercentile of home power within the window, so short load peaks don't cause export
+	// dispatchPercentile of demand within the window, so short peaks neither cause export nor import
 	dispatchPercentile = 0.1
 	// dispatchBalanceSpread is the scaled soc difference at which balancing reaches full effect
 	dispatchBalanceSpread = 0.1
@@ -25,7 +25,6 @@ const (
 type dispatchBattery struct {
 	controlled   bool            // accepts a power setpoint, otherwise self-regulating
 	mode         api.BatteryMode // mode applied to this battery
-	batteryPower float64         // W, measured at the battery, positive = discharge
 	soc          *float64
 	minSoc       float64
 	maxSoc       float64
@@ -45,8 +44,16 @@ func (b dispatchBattery) scaledSoc() float64 {
 	return (*b.soc - lo) / (hi - lo)
 }
 
+// forced returns if a forced mode owns the device
+func (b dispatchBattery) forced() bool {
+	return b.mode == api.BatteryCharge || b.mode == api.BatteryDischarge
+}
+
 // allows returns if the mode and soc allow the battery to discharge or charge
 func (b dispatchBattery) allows(discharging bool) bool {
+	if b.soc == nil || b.forced() {
+		return false
+	}
 	if discharging {
 		return b.mode != api.BatteryHoldDischarge && b.scaledSoc() > 0
 	}
@@ -74,11 +81,11 @@ func (b dispatchBattery) priority(discharging bool) float64 {
 	return prio
 }
 
-// dispatchBatteryPower determines the share of the net battery power the controlled batteries take
-// together and fills it into as few of them as possible. The self-regulating batteries take the
-// remainder. headroom caps the discharge, since the self-regulating inverter cannot absorb export.
+// dispatchBatteryPower splits the demand the batteries cover together, positive = discharge, between
+// the batteries able to take it and fills the controlled batteries' part into as few of them as possible.
+// The self-regulating batteries take the remainder.
 // Returns the setpoint per battery, nil for batteries that are not dispatched.
-func dispatchBatteryPower(bb []dispatchBattery, headroom float64) []*float64 {
+func dispatchBatteryPower(bb []dispatchBattery, demand float64) []*float64 {
 	res := make([]*float64, len(bb))
 
 	// like the site soc, weigh by capacity only if all capacities are known
@@ -90,32 +97,28 @@ func dispatchBatteryPower(bb []dispatchBattery, headroom float64) []*float64 {
 		return 1
 	}
 
-	var netPower, totalWeight, scaledSocAcc float64
+	// all batteries follow the direction of the demand, opposite directions would move energy between them
+	discharging := demand > 0
+
+	var socWeight, scaledSocAcc, takeWeight float64
 	for _, b := range bb {
-		netPower += b.batteryPower
-		if b.soc != nil {
-			totalWeight += weight(b)
-			scaledSocAcc += b.scaledSoc() * weight(b)
+		if b.soc == nil {
+			continue
+		}
+		socWeight += weight(b)
+		scaledSocAcc += b.scaledSoc() * weight(b)
+
+		// a full or empty battery's share goes to the others
+		if b.allows(discharging) {
+			takeWeight += weight(b)
 		}
 	}
-	if totalWeight == 0 {
-		return res
-	}
-	mean := scaledSocAcc / totalWeight
 
-	// all batteries follow the direction of the net power, opposite directions would move energy between them
-	discharging := netPower >= 0
-
-	// the controlled batteries' share: each battery's fair share shifted by its distance from the mean
+	// the controlled batteries' part: each battery's share shifted by its distance from the mean
 	var total float64
 	var candidates []int
 	for i, b := range bb {
-		if !b.controlled || b.soc == nil {
-			continue
-		}
-
-		// forced modes own the device
-		if b.mode == api.BatteryCharge || b.mode == api.BatteryDischarge {
+		if !b.controlled || b.soc == nil || b.forced() {
 			continue
 		}
 
@@ -124,18 +127,17 @@ func dispatchBatteryPower(bb []dispatchBattery, headroom float64) []*float64 {
 			continue
 		}
 
-		balance := max(-1, min(1, (b.scaledSoc()-mean)/dispatchBalanceSpread))
+		balance := max(-1, min(1, (b.scaledSoc()-scaledSocAcc/socWeight)/dispatchBalanceSpread))
 		if !discharging {
 			balance = -balance
 		}
 
-		total += math.Abs(netPower) * weight(b) / totalWeight * (1 + balance)
+		total += math.Abs(demand) * weight(b) / takeWeight * (1 + balance)
 		candidates = append(candidates, i)
 	}
 
-	if discharging {
-		total = min(total, max(0, headroom))
-	}
+	// more than the demand would make the self-regulating batteries compensate in the opposite direction
+	total = min(total, math.Abs(demand))
 
 	slices.SortStableFunc(candidates, func(i, j int) int {
 		return cmp.Compare(bb[j].priority(discharging), bb[i].priority(discharging))
@@ -167,25 +169,40 @@ type timedPower struct {
 	power float64
 }
 
-// recordHomePower adds a home power sample to the dispatch window
-func (site *Site) recordHomePower(now time.Time, power float64) {
-	site.homePowerWindow = append(site.homePowerWindow, timedPower{now, power})
-	site.homePowerWindow = slices.DeleteFunc(site.homePowerWindow, func(s timedPower) bool {
+// recordDemand adds a demand sample to the dispatch window
+func (site *Site) recordDemand(now time.Time, power float64) {
+	site.demandWindow = append(site.demandWindow, timedPower{now, power})
+	site.demandWindow = slices.DeleteFunc(site.demandWindow, func(s timedPower) bool {
 		return now.Sub(s.ts) > dispatchWindow
 	})
 }
 
-// homePowerPercentile returns the given percentile of the home power window
-func (site *Site) homePowerPercentile(p float64) float64 {
-	if len(site.homePowerWindow) == 0 {
+// dispatchDemand returns the demand the batteries can cover without exporting or importing within the
+// window: the low percentile if it's a deficit, the high percentile if it's a surplus, else zero.
+// reserve is left to the self-regulating batteries in either direction.
+func (site *Site) dispatchDemand(reserve float64) float64 {
+	if len(site.demandWindow) == 0 {
 		return 0
 	}
-	vals := make([]float64, 0, len(site.homePowerWindow))
-	for _, s := range site.homePowerWindow {
+
+	vals := make([]float64, 0, len(site.demandWindow))
+	for _, s := range site.demandWindow {
 		vals = append(vals, s.power)
 	}
 	slices.Sort(vals)
-	return vals[int(math.Floor(p*float64(len(vals)-1)))]
+
+	n := float64(len(vals) - 1)
+	low := vals[int(math.Floor(dispatchPercentile*n))]
+	high := vals[int(math.Ceil((1-dispatchPercentile)*n))]
+
+	switch {
+	case low-reserve > 0:
+		return low - reserve
+	case high+reserve < 0:
+		return high + reserve
+	default:
+		return 0
+	}
 }
 
 // dispatchBatteries applies power setpoints to batteries that accept them
@@ -203,7 +220,7 @@ func (site *Site) dispatchBatteries() {
 		meter := dev.Instance()
 		m := devices[i]
 
-		b := dispatchBattery{batteryPower: m.Power, soc: m.Soc, maxSoc: 100}
+		b := dispatchBattery{soc: m.Soc, maxSoc: 100}
 		if m.MinSoc != nil {
 			b.minSoc = *m.MinSoc
 		}
@@ -214,15 +231,15 @@ func (site *Site) dispatchBatteries() {
 			b.capacity = *m.Capacity
 		}
 
+		b.mode = site.batteryModeApplied[dev.Config().Name]
+		if b.mode == api.BatteryUnknown {
+			b.mode = site.GetBatteryMode()
+		}
+
 		if ctrl, ok := api.Cap[api.BatteryPowerController](meter); ok {
 			ctrls[i] = ctrl
 			b.controlled = true
 			controlled = true
-
-			b.mode = site.batteryModeApplied[dev.Config().Name]
-			if b.mode == api.BatteryUnknown {
-				b.mode = site.GetBatteryMode()
-			}
 
 			b.minPower = ctrl.MinBatteryPower()
 			b.setpoint = site.batterySetpoints[dev.Config().Name]
@@ -241,9 +258,9 @@ func (site *Site) dispatchBatteries() {
 		return
 	}
 
-	headroom := site.homePowerPercentile(dispatchPercentile) - site.BatteryDispatchReserve
+	demand := site.dispatchDemand(site.BatteryDispatchReserve)
 
-	for i, p := range dispatchBatteryPower(bb, headroom) {
+	for i, p := range dispatchBatteryPower(bb, demand) {
 		if p == nil {
 			continue
 		}
@@ -261,6 +278,6 @@ func (site *Site) dispatchBatteries() {
 		}
 		site.batterySetpoints[dev.Config().Name] = *p
 
-		site.log.DEBUG.Printf("battery %s power setpoint: %.0fW (headroom %.0fW)", deviceTitleOrName(dev), *p, headroom)
+		site.log.DEBUG.Printf("battery %s power setpoint: %.0fW (demand %.0fW)", deviceTitleOrName(dev), *p, demand)
 	}
 }

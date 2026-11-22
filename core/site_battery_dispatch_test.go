@@ -10,252 +10,236 @@ import (
 
 func TestDispatchBatteryPower(t *testing.T) {
 	// kostal is self-regulating, marstek takes setpoints
-	kostal := func(soc, power float64) dispatchBattery {
-		return dispatchBattery{soc: new(soc), minSoc: 10, maxSoc: 100, capacity: 10, batteryPower: power}
+	kostal := func(soc float64) dispatchBattery {
+		return dispatchBattery{mode: api.BatteryNormal, soc: new(soc), minSoc: 10, maxSoc: 100, capacity: 10}
 	}
-	marstek := func(soc, power float64, mode api.BatteryMode) dispatchBattery {
-		return dispatchBattery{controlled: true, mode: mode, soc: new(soc), minSoc: 10, maxSoc: 100, capacity: 5, batteryPower: power, maxCharge: 1500, maxDischarge: 800}
+	marstek := func(soc float64, mode api.BatteryMode) dispatchBattery {
+		return dispatchBattery{controlled: true, mode: mode, soc: new(soc), minSoc: 10, maxSoc: 100, capacity: 5, maxCharge: 1500, maxDischarge: 800}
 	}
-
-	minPower := func(b dispatchBattery, p float64) dispatchBattery {
+	withMode := func(b dispatchBattery, mode api.BatteryMode) dispatchBattery {
+		b.mode = mode
+		return b
+	}
+	withMinPower := func(b dispatchBattery, p float64) dispatchBattery {
 		b.minPower = p
 		return b
 	}
-	setpoint := func(b dispatchBattery, p float64) dispatchBattery {
+	withSetpoint := func(b dispatchBattery, p float64) dispatchBattery {
 		b.setpoint = p
 		return b
 	}
+	normal := api.BatteryNormal
 
 	for _, tc := range []struct {
-		name     string
-		bb       []dispatchBattery
-		headroom float64
-		res      []*float64
+		name   string
+		bb     []dispatchBattery
+		demand float64
+		res    []*float64
 	}{
 		{
 			"equal soc discharge: share by capacity",
-			[]dispatchBattery{kostal(55, 900), marstek(55, 0, api.BatteryNormal)},
-			1000,
+			[]dispatchBattery{kostal(55), marstek(55, normal)},
+			900,
 			[]*float64{nil, new(300.0)},
 		},
 		{
 			"marstek fuller: discharges double share",
-			[]dispatchBattery{kostal(50, 900), marstek(65, 0, api.BatteryNormal)},
-			1000,
+			[]dispatchBattery{kostal(50), marstek(65, normal)},
+			900,
 			[]*float64{nil, new(600.0)},
 		},
 		{
 			"marstek emptier: no discharge",
-			[]dispatchBattery{kostal(60, 900), marstek(45, 0, api.BatteryNormal)},
-			1000,
+			[]dispatchBattery{kostal(60), marstek(45, normal)},
+			900,
 			[]*float64{nil, new(0.0)},
 		},
 		{
-			"discharge capped by headroom",
-			[]dispatchBattery{kostal(50, 900), marstek(65, 0, api.BatteryNormal)},
-			250,
-			[]*float64{nil, new(250.0)},
-		},
-		{
-			"no headroom",
-			[]dispatchBattery{kostal(50, 900), marstek(65, 0, api.BatteryNormal)},
-			-100,
-			[]*float64{nil, new(0.0)},
+			"kostal empty: marstek covers the import",
+			[]dispatchBattery{kostal(10), marstek(65, normal)},
+			900,
+			[]*float64{nil, new(800.0)}, // limited by max discharge
 		},
 		{
 			"marstek emptier: charges double share",
-			[]dispatchBattery{kostal(60, -1200), marstek(45, 0, api.BatteryNormal)},
-			1000,
+			[]dispatchBattery{kostal(60), marstek(45, normal)},
+			-1200,
 			[]*float64{nil, new(-800.0)},
 		},
 		{
 			"marstek fuller: no charge",
-			[]dispatchBattery{kostal(50, -1200), marstek(65, 0, api.BatteryNormal)},
-			1000,
+			[]dispatchBattery{kostal(50), marstek(65, normal)},
+			-1200,
 			[]*float64{nil, new(0.0)},
 		},
 		{
+			"kostal full: marstek takes the export",
+			[]dispatchBattery{kostal(100), marstek(50, normal)},
+			-1200,
+			[]*float64{nil, new(-1200.0)}, // capped at the surplus
+		},
+		{
 			"charge limited",
-			[]dispatchBattery{kostal(60, -3000), marstek(45, 0, api.BatteryNormal)},
-			1000,
+			[]dispatchBattery{kostal(60), marstek(45, normal)},
+			-3000,
 			[]*float64{nil, new(-1500.0)},
 		},
 		{
-			"net includes the marstek's own power",
-			[]dispatchBattery{kostal(55, 600), marstek(55, 300, api.BatteryNormal)},
-			1000,
-			[]*float64{nil, new(300.0)},
+			"no demand",
+			[]dispatchBattery{kostal(55), marstek(55, normal)},
+			0,
+			[]*float64{nil, new(0.0)},
 		},
 		{
 			"holddischarge blocks discharge",
-			[]dispatchBattery{kostal(50, 900), marstek(65, 0, api.BatteryHoldDischarge)},
-			1000,
+			[]dispatchBattery{kostal(50), marstek(65, api.BatteryHoldDischarge)},
+			900,
 			[]*float64{nil, new(0.0)},
 		},
 		{
 			"holddischarge allows charge",
-			[]dispatchBattery{kostal(60, -1200), marstek(45, 0, api.BatteryHoldDischarge)},
-			1000,
+			[]dispatchBattery{kostal(60), marstek(45, api.BatteryHoldDischarge)},
+			-1200,
 			[]*float64{nil, new(-800.0)},
 		},
 		{
 			"holdcharge blocks charge",
-			[]dispatchBattery{kostal(60, -1200), marstek(45, 0, api.BatteryHoldCharge)},
-			1000,
+			[]dispatchBattery{kostal(60), marstek(45, api.BatteryHoldCharge)},
+			-1200,
 			[]*float64{nil, new(0.0)},
 		},
 		{
+			"held kostal: marstek takes its share",
+			[]dispatchBattery{withMode(kostal(55), api.BatteryHoldDischarge), marstek(55, normal)},
+			900,
+			[]*float64{nil, new(800.0)}, // limited by max discharge
+		},
+		{
 			"unknown mode treated as normal",
-			[]dispatchBattery{kostal(55, 900), marstek(55, 0, api.BatteryUnknown)},
-			1000,
+			[]dispatchBattery{kostal(55), marstek(55, api.BatteryUnknown)},
+			900,
 			[]*float64{nil, new(300.0)},
 		},
 		{
 			"forced charge owns the device",
-			[]dispatchBattery{kostal(55, 900), marstek(55, 0, api.BatteryCharge)},
-			1000,
+			[]dispatchBattery{kostal(55), marstek(55, api.BatteryCharge)},
+			900,
 			[]*float64{nil, nil},
 		},
 		{
 			"forced discharge owns the device",
-			[]dispatchBattery{kostal(55, 900), marstek(55, 0, api.BatteryDischarge)},
-			1000,
+			[]dispatchBattery{kostal(55), marstek(55, api.BatteryDischarge)},
+			900,
 			[]*float64{nil, nil},
 		},
 		{
 			"at min soc: no discharge",
-			[]dispatchBattery{kostal(10, 900), marstek(10, 0, api.BatteryNormal)},
-			1000,
+			[]dispatchBattery{kostal(10), marstek(10, normal)},
+			900,
 			[]*float64{nil, new(0.0)},
 		},
 		{
 			"at max soc: no charge",
-			[]dispatchBattery{kostal(100, -900), marstek(100, 0, api.BatteryNormal)},
-			1000,
+			[]dispatchBattery{kostal(100), marstek(100, normal)},
+			-900,
 			[]*float64{nil, new(0.0)},
 		},
 		{
 			"scaled soc respects different limits",
 			// kostal 55% of 10..100 = 0.5, marstek 60% of 20..100 = 0.5
-			[]dispatchBattery{kostal(55, 900), {controlled: true, mode: api.BatteryNormal, soc: new(60.0), minSoc: 20, maxSoc: 100, capacity: 5}},
-			1000,
+			[]dispatchBattery{kostal(55), {controlled: true, mode: normal, soc: new(60.0), minSoc: 20, maxSoc: 100, capacity: 5}},
+			900,
 			[]*float64{nil, new(300.0)},
 		},
 		{
 			"missing capacity: equal weights",
-			// unweighted the marstek would be 300 with the kostal at 10 kWh
-			[]dispatchBattery{{soc: new(55.0), minSoc: 10, maxSoc: 100, batteryPower: 900}, marstek(55, 0, api.BatteryNormal)},
-			1000,
+			[]dispatchBattery{{mode: normal, soc: new(55.0), minSoc: 10, maxSoc: 100}, marstek(55, normal)},
+			900,
 			[]*float64{nil, new(450.0)},
 		},
 		{
 			"missing capacity: still balanced against the self-regulating battery",
-			[]dispatchBattery{{soc: new(50.0), minSoc: 10, maxSoc: 100, batteryPower: 900}, marstek(65, 0, api.BatteryNormal)},
-			1000,
-			[]*float64{nil, new(800.0)}, // 900 capped at max discharge
+			[]dispatchBattery{{mode: normal, soc: new(50.0), minSoc: 10, maxSoc: 100}, marstek(65, normal)},
+			900,
+			[]*float64{nil, new(800.0)}, // 825 limited by max discharge
 		},
 		{
 			"missing soc: not dispatched",
-			[]dispatchBattery{kostal(55, 900), {controlled: true, mode: api.BatteryNormal, capacity: 5}},
-			1000,
+			[]dispatchBattery{kostal(55), {controlled: true, mode: normal, capacity: 5}},
+			900,
 			[]*float64{nil, nil},
 		},
 		{
-			"three batteries: headroom filled into one",
-			[]dispatchBattery{kostal(50, 1500), marstek(65, 0, api.BatteryNormal), marstek(65, 0, api.BatteryNormal)},
-			600,
-			[]*float64{nil, new(600.0), new(0.0)},
-		},
-		{
 			"below min power: stopped",
-			[]dispatchBattery{kostal(55, 200), minPower(marstek(55, 0, api.BatteryNormal), 100)},
-			1000,
+			[]dispatchBattery{kostal(55), withMinPower(marstek(55, normal), 100)},
+			200,
 			[]*float64{nil, new(0.0)},
 		},
 		{
 			"charge below min power: stopped",
-			[]dispatchBattery{kostal(55, -200), minPower(marstek(55, 0, api.BatteryNormal), 100)},
-			1000,
+			[]dispatchBattery{kostal(55), withMinPower(marstek(55, normal), 100)},
+			-200,
 			[]*float64{nil, new(0.0)},
 		},
 		{
-			"headroom below min power: stopped",
-			[]dispatchBattery{kostal(50, 900), minPower(marstek(65, 0, api.BatteryNormal), 100)},
-			80,
-			[]*float64{nil, new(0.0)},
-		},
-		{
-			"headroom goes to the batteries that run",
-			// scaled to 75 each both would stop, the last one is stopped and the other takes the full headroom
-			[]dispatchBattery{kostal(50, 1500), minPower(marstek(65, 0, api.BatteryNormal), 100), minPower(marstek(65, 0, api.BatteryNormal), 100)},
+			"three batteries: small demand runs one inverter",
+			// 69 each would both be below min power
+			[]dispatchBattery{kostal(50), withMinPower(marstek(65, normal), 100), withMinPower(marstek(65, normal), 100)},
 			150,
-			[]*float64{nil, new(150.0), new(0.0)},
+			[]*float64{nil, new(137.5), new(0.0)},
 		},
 		{
-			"stopped target does not reduce the others",
-			// the second marstek targets 75 and stops before the headroom is shared
-			[]dispatchBattery{kostal(55, 1150), minPower(marstek(64, 0, api.BatteryNormal), 100), minPower(marstek(50, 0, api.BatteryNormal), 100)},
-			500,
-			[]*float64{nil, new(500.0), new(0.0)},
-		},
-		{
-			"smallest battery stopped first",
-			[]dispatchBattery{kostal(55, 2000), minPower(marstek(64, 0, api.BatteryNormal), 100), minPower(marstek(52, 0, api.BatteryNormal), 100)},
-			400,
-			[]*float64{nil, new(400.0), new(0.0)},
+			"three batteries: equal soc consolidated into one",
+			[]dispatchBattery{kostal(55), withMinPower(marstek(55, normal), 100), withMinPower(marstek(55, normal), 100)},
+			1200,
+			[]*float64{nil, new(600.0), new(0.0)},
 		},
 		{
 			"three batteries: overflow beyond max power to the next",
-			// mean usable 0.5, the fuller marstek's share of 1000 exceeds its max discharge
-			[]dispatchBattery{kostal(55, 2000), marstek(64, 0, api.BatteryNormal), marstek(46, 0, api.BatteryNormal)},
+			// scaled soc 0.5, 0.6 and 0.4, the fuller marstek's share of 1000 exceeds its max discharge
+			[]dispatchBattery{kostal(55), marstek(64, normal), marstek(46, normal)},
 			2000,
 			[]*float64{nil, new(800.0), new(200.0)},
 		},
 		{
-			"three batteries: equal soc consolidated into one",
-			[]dispatchBattery{kostal(55, 1200), minPower(marstek(55, 0, api.BatteryNormal), 100), minPower(marstek(55, 0, api.BatteryNormal), 100)},
-			1000,
-			[]*float64{nil, new(600.0), new(0.0)},
-		},
-		{
 			"three batteries: fullest discharges",
-			[]dispatchBattery{kostal(55, 1200), marstek(54, 0, api.BatteryNormal), marstek(56, 0, api.BatteryNormal)},
-			1000,
+			[]dispatchBattery{kostal(55), marstek(54, normal), marstek(56, normal)},
+			1200,
 			[]*float64{nil, new(0.0), new(600.0)},
 		},
 		{
 			"three batteries: emptiest charges",
-			[]dispatchBattery{kostal(55, -1200), marstek(54, 0, api.BatteryNormal), marstek(56, 0, api.BatteryNormal)},
-			1000,
+			[]dispatchBattery{kostal(55), marstek(54, normal), marstek(56, normal)},
+			-1200,
 			[]*float64{nil, new(-600.0), new(0.0)},
 		},
 		{
 			"three batteries: running battery kept within switch spread",
-			[]dispatchBattery{kostal(55, 1200), setpoint(marstek(54, 0, api.BatteryNormal), 600), marstek(57, 0, api.BatteryNormal)},
-			1000,
+			[]dispatchBattery{kostal(55), withSetpoint(marstek(54, normal), 600), marstek(57, normal)},
+			1200,
 			[]*float64{nil, new(617.0), new(0.0)}, // shares 258 + 358
 		},
 		{
 			"three batteries: switched over beyond switch spread",
-			[]dispatchBattery{kostal(55, 1200), setpoint(marstek(52, 0, api.BatteryNormal), 600), marstek(58, 0, api.BatteryNormal)},
-			1000,
+			[]dispatchBattery{kostal(55), withSetpoint(marstek(52, normal), 600), marstek(58, normal)},
+			1200,
 			[]*float64{nil, new(0.0), new(600.0)},
 		},
 		{
 			"three batteries: running charge does not hold discharge",
-			[]dispatchBattery{kostal(55, 1200), setpoint(marstek(54, 0, api.BatteryNormal), -600), marstek(56, 0, api.BatteryNormal)},
-			1000,
+			[]dispatchBattery{kostal(55), withSetpoint(marstek(54, normal), -600), marstek(56, normal)},
+			1200,
 			[]*float64{nil, new(0.0), new(600.0)},
 		},
 		{
-			"three batteries: held battery skipped",
-			[]dispatchBattery{kostal(55, 1200), marstek(60, 0, api.BatteryHoldDischarge), marstek(55, 0, api.BatteryNormal)},
-			1000,
-			[]*float64{nil, new(0.0), new(258.0)}, // the held battery's share goes to the kostal
+			"three batteries: held battery's share goes to the others",
+			[]dispatchBattery{kostal(55), marstek(60, api.BatteryHoldDischarge), marstek(55, normal)},
+			1200,
+			[]*float64{nil, new(0.0), new(344.0)},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			res := dispatchBatteryPower(tc.bb, tc.headroom)
+			res := dispatchBatteryPower(tc.bb, tc.demand)
 			assert.Len(t, res, len(tc.res))
 			for i := range tc.res {
 				if tc.res[i] == nil {
@@ -270,20 +254,34 @@ func TestDispatchBatteryPower(t *testing.T) {
 	}
 }
 
-func TestHomePowerPercentile(t *testing.T) {
-	site := &Site{}
-	assert.Zero(t, site.homePowerPercentile(dispatchPercentile))
-
-	now := time.Now()
-	for i, p := range []float64{900, 300, 2500, 400, 350, 800, 600, 500, 700, 450, 3000} {
-		site.recordHomePower(now.Add(time.Duration(i)*30*time.Second), p)
+func TestDispatchDemand(t *testing.T) {
+	record := func(vals ...float64) *Site {
+		site := &Site{}
+		now := time.Now()
+		for i, p := range vals {
+			site.recordDemand(now.Add(time.Duration(i)*30*time.Second), p)
+		}
+		return site
 	}
 
-	// samples older than the window were dropped
-	assert.Len(t, site.homePowerWindow, 11)
-	site.recordHomePower(now.Add(11*30*time.Second), 650)
-	assert.Len(t, site.homePowerWindow, 11)
+	assert.Zero(t, (&Site{}).dispatchDemand(100))
 
-	// the short load peaks do not raise the headroom
-	assert.Equal(t, 350.0, site.homePowerPercentile(dispatchPercentile))
+	// samples older than the window are dropped
+	site := record(900, 300, 2500, 400, 350, 800, 600, 500, 700, 450, 3000, 650)
+	assert.Len(t, site.demandWindow, 11)
+
+	// deficit: low percentile, short load peaks do not raise it
+	assert.Equal(t, 250.0, site.dispatchDemand(100))
+
+	// surplus: high percentile, short pv peaks do not raise it
+	site = record(-800, -1200, -300, -900, -1000, -700, -1100, -600, -950, -850, -750)
+	assert.Equal(t, -500.0, site.dispatchDemand(100))
+
+	// fluctuating around zero
+	site = record(-800, -500, -300, 200, 400, 600, -100, 300, -200, 500, 100)
+	assert.Zero(t, site.dispatchDemand(100))
+
+	// reserve larger than the demand
+	site = record(150, 200, 250, 180, 220, 190, 210, 230, 170, 240, 160)
+	assert.Zero(t, site.dispatchDemand(200))
 }
