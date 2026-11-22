@@ -11,13 +11,13 @@ import (
 )
 
 const (
-	// dispatchWindow is the home power history the discharge headroom is derived from
+	// dispatchWindow is the home power history the discharging headroom is derived from
 	dispatchWindow = 5 * time.Minute
 	// dispatchPercentile of home power within the window, so short load peaks don't cause export
 	dispatchPercentile = 0.1
-	// dispatchBalanceSpread is the usable soc difference at which balancing reaches full effect
+	// dispatchBalanceSpread is the scaled soc difference at which balancing reaches full effect
 	dispatchBalanceSpread = 0.1
-	// dispatchSwitchSpread is the usable soc lead another battery needs to take over from a running one
+	// dispatchSwitchSpread is the scaled soc lead another battery needs to take over from a running one
 	dispatchSwitchSpread = 0.05
 )
 
@@ -25,7 +25,7 @@ const (
 type dispatchBattery struct {
 	controlled   bool            // accepts a power setpoint, otherwise self-regulating
 	mode         api.BatteryMode // mode applied to this battery
-	power        float64         // measured power, positive = discharge
+	batteryPower float64         // W, measured at the battery, positive = discharge
 	soc          *float64
 	minSoc       float64
 	maxSoc       float64
@@ -36,8 +36,8 @@ type dispatchBattery struct {
 	setpoint     float64 // W, last setpoint applied
 }
 
-// usable returns the soc as fraction of the usable range between min and max soc
-func (b dispatchBattery) usable() float64 {
+// scaledSoc returns the soc rescaled to the range between min and max soc, 0..1
+func (b dispatchBattery) scaledSoc() float64 {
 	lo, hi := b.minSoc, b.maxSoc
 	if hi <= lo {
 		lo, hi = 0, 100
@@ -46,29 +46,29 @@ func (b dispatchBattery) usable() float64 {
 }
 
 // allows returns if the mode and soc allow the battery to discharge or charge
-func (b dispatchBattery) allows(discharge bool) bool {
-	if discharge {
-		return b.mode != api.BatteryHoldDischarge && b.usable() > 0
+func (b dispatchBattery) allows(discharging bool) bool {
+	if discharging {
+		return b.mode != api.BatteryHoldDischarge && b.scaledSoc() > 0
 	}
-	return b.mode != api.BatteryHoldCharge && b.usable() < 1
+	return b.mode != api.BatteryHoldCharge && b.scaledSoc() < 1
 }
 
 // maxPower returns the power limit in the given direction, 0 = unlimited
-func (b dispatchBattery) maxPower(discharge bool) float64 {
-	if discharge {
+func (b dispatchBattery) maxPower(discharging bool) float64 {
+	if discharging {
 		return b.maxDischarge
 	}
 	return b.maxCharge
 }
 
-// priority orders the batteries to fill: fullest first for discharge, emptiest first for charge.
+// priority orders the batteries to fill: fullest first when discharging, emptiest first when charging.
 // A running battery keeps its place until another leads by dispatchSwitchSpread.
-func (b dispatchBattery) priority(discharge bool) float64 {
-	prio := b.usable()
-	if !discharge {
+func (b dispatchBattery) priority(discharging bool) float64 {
+	prio := b.scaledSoc()
+	if !discharging {
 		prio = -prio
 	}
-	if discharge && b.setpoint > 0 || !discharge && b.setpoint < 0 {
+	if discharging && b.setpoint > 0 || !discharging && b.setpoint < 0 {
 		prio += dispatchSwitchSpread
 	}
 	return prio
@@ -90,19 +90,21 @@ func dispatchBatteryPower(bb []dispatchBattery, headroom float64) []*float64 {
 		return 1
 	}
 
-	var net, totalWeight, usableAcc float64
+	var netPower, totalWeight, scaledSocAcc float64
 	for _, b := range bb {
-		net += b.power
+		netPower += b.batteryPower
 		if b.soc != nil {
 			totalWeight += weight(b)
-			usableAcc += b.usable() * weight(b)
+			scaledSocAcc += b.scaledSoc() * weight(b)
 		}
 	}
 	if totalWeight == 0 {
 		return res
 	}
-	mean := usableAcc / totalWeight
-	discharge := net >= 0
+	mean := scaledSocAcc / totalWeight
+
+	// all batteries follow the direction of the net power, opposite directions would move energy between them
+	discharging := netPower >= 0
 
 	// the controlled batteries' share: each battery's fair share shifted by its distance from the mean
 	var total float64
@@ -118,30 +120,30 @@ func dispatchBatteryPower(bb []dispatchBattery, headroom float64) []*float64 {
 		}
 
 		res[i] = new(0.0)
-		if !b.allows(discharge) {
+		if !b.allows(discharging) {
 			continue
 		}
 
-		balance := max(-1, min(1, (b.usable()-mean)/dispatchBalanceSpread))
-		if !discharge {
+		balance := max(-1, min(1, (b.scaledSoc()-mean)/dispatchBalanceSpread))
+		if !discharging {
 			balance = -balance
 		}
 
-		total += math.Abs(net) * weight(b) / totalWeight * (1 + balance)
+		total += math.Abs(netPower) * weight(b) / totalWeight * (1 + balance)
 		candidates = append(candidates, i)
 	}
 
-	if discharge {
+	if discharging {
 		total = min(total, max(0, headroom))
 	}
 
 	slices.SortStableFunc(candidates, func(i, j int) int {
-		return cmp.Compare(bb[j].priority(discharge), bb[i].priority(discharge))
+		return cmp.Compare(bb[j].priority(discharging), bb[i].priority(discharging))
 	})
 
 	for _, i := range candidates {
 		p := total
-		if limit := bb[i].maxPower(discharge); limit > 0 {
+		if limit := bb[i].maxPower(discharging); limit > 0 {
 			p = min(p, limit)
 		}
 
@@ -151,7 +153,7 @@ func dispatchBatteryPower(bb []dispatchBattery, headroom float64) []*float64 {
 		}
 
 		total -= p
-		if !discharge {
+		if !discharging {
 			p = -p
 		}
 		*res[i] = p
@@ -201,7 +203,7 @@ func (site *Site) dispatchBatteries() {
 		meter := dev.Instance()
 		m := devices[i]
 
-		b := dispatchBattery{power: m.Power, soc: m.Soc, maxSoc: 100}
+		b := dispatchBattery{batteryPower: m.Power, soc: m.Soc, maxSoc: 100}
 		if m.MinSoc != nil {
 			b.minSoc = *m.MinSoc
 		}

@@ -11,10 +11,10 @@ import (
 func TestDispatchBatteryPower(t *testing.T) {
 	// kostal is self-regulating, marstek takes setpoints
 	kostal := func(soc, power float64) dispatchBattery {
-		return dispatchBattery{soc: new(soc), minSoc: 10, maxSoc: 100, capacity: 10, power: power}
+		return dispatchBattery{soc: new(soc), minSoc: 10, maxSoc: 100, capacity: 10, batteryPower: power}
 	}
 	marstek := func(soc, power float64, mode api.BatteryMode) dispatchBattery {
-		return dispatchBattery{controlled: true, mode: mode, soc: new(soc), minSoc: 10, maxSoc: 100, capacity: 5, power: power, maxCharge: 1500, maxDischarge: 800}
+		return dispatchBattery{controlled: true, mode: mode, soc: new(soc), minSoc: 10, maxSoc: 100, capacity: 5, batteryPower: power, maxCharge: 1500, maxDischarge: 800}
 	}
 
 	minPower := func(b dispatchBattery, p float64) dispatchBattery {
@@ -135,7 +135,7 @@ func TestDispatchBatteryPower(t *testing.T) {
 			[]*float64{nil, new(0.0)},
 		},
 		{
-			"usable soc respects different limits",
+			"scaled soc respects different limits",
 			// kostal 55% of 10..100 = 0.5, marstek 60% of 20..100 = 0.5
 			[]dispatchBattery{kostal(55, 900), {controlled: true, mode: api.BatteryNormal, soc: new(60.0), minSoc: 20, maxSoc: 100, capacity: 5}},
 			1000,
@@ -144,13 +144,13 @@ func TestDispatchBatteryPower(t *testing.T) {
 		{
 			"missing capacity: equal weights",
 			// unweighted the marstek would be 300 with the kostal at 10 kWh
-			[]dispatchBattery{{soc: new(55.0), minSoc: 10, maxSoc: 100, power: 900}, marstek(55, 0, api.BatteryNormal)},
+			[]dispatchBattery{{soc: new(55.0), minSoc: 10, maxSoc: 100, batteryPower: 900}, marstek(55, 0, api.BatteryNormal)},
 			1000,
 			[]*float64{nil, new(450.0)},
 		},
 		{
 			"missing capacity: still balanced against the self-regulating battery",
-			[]dispatchBattery{{soc: new(50.0), minSoc: 10, maxSoc: 100, power: 900}, marstek(65, 0, api.BatteryNormal)},
+			[]dispatchBattery{{soc: new(50.0), minSoc: 10, maxSoc: 100, batteryPower: 900}, marstek(65, 0, api.BatteryNormal)},
 			1000,
 			[]*float64{nil, new(800.0)}, // 900 capped at max discharge
 		},
