@@ -70,8 +70,6 @@ type Site struct {
 	Meters        MetersConfig `mapstructure:"meters"`        // Meter references
 	CurtailersRef []string     `mapstructure:"curtailers"`    // Curtailment device references
 
-	BatteryDispatchReserve float64 `mapstructure:"batteryDispatchReserve"` // demand in W left to self-regulating batteries for regulation
-
 	// meters
 	circuit        api.Circuit                // Circuit
 	hems           api.HEMS                   // HEMS (set by configureHEMS at boot)

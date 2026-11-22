@@ -179,8 +179,7 @@ func (site *Site) recordDemand(now time.Time, power float64) {
 
 // dispatchDemand returns the demand the batteries can cover without exporting or importing within the
 // window: the low percentile if it's a deficit, the high percentile if it's a surplus, else zero.
-// reserve is left to the self-regulating batteries in either direction.
-func (site *Site) dispatchDemand(reserve float64) float64 {
+func (site *Site) dispatchDemand() float64 {
 	if len(site.demandWindow) == 0 {
 		return 0
 	}
@@ -196,10 +195,10 @@ func (site *Site) dispatchDemand(reserve float64) float64 {
 	high := vals[int(math.Ceil((1-dispatchPercentile)*n))]
 
 	switch {
-	case low-reserve > 0:
-		return low - reserve
-	case high+reserve < 0:
-		return high + reserve
+	case low > 0:
+		return low
+	case high < 0:
+		return high
 	default:
 		return 0
 	}
@@ -258,7 +257,7 @@ func (site *Site) dispatchBatteries() {
 		return
 	}
 
-	demand := site.dispatchDemand(site.BatteryDispatchReserve)
+	demand := site.dispatchDemand()
 
 	for i, p := range dispatchBatteryPower(bb, demand) {
 		if p == nil {

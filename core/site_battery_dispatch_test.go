@@ -264,24 +264,20 @@ func TestDispatchDemand(t *testing.T) {
 		return site
 	}
 
-	assert.Zero(t, (&Site{}).dispatchDemand(100))
+	assert.Zero(t, (&Site{}).dispatchDemand())
 
 	// samples older than the window are dropped
 	site := record(900, 300, 2500, 400, 350, 800, 600, 500, 700, 450, 3000, 650)
 	assert.Len(t, site.demandWindow, 11)
 
 	// deficit: low percentile, short load peaks do not raise it
-	assert.Equal(t, 250.0, site.dispatchDemand(100))
+	assert.Equal(t, 350.0, site.dispatchDemand())
 
 	// surplus: high percentile, short pv peaks do not raise it
 	site = record(-800, -1200, -300, -900, -1000, -700, -1100, -600, -950, -850, -750)
-	assert.Equal(t, -500.0, site.dispatchDemand(100))
+	assert.Equal(t, -600.0, site.dispatchDemand())
 
 	// fluctuating around zero
 	site = record(-800, -500, -300, 200, 400, 600, -100, 300, -200, 500, 100)
-	assert.Zero(t, site.dispatchDemand(100))
-
-	// reserve larger than the demand
-	site = record(150, 200, 250, 180, 220, 190, 210, 230, 170, 240, 160)
-	assert.Zero(t, site.dispatchDemand(200))
+	assert.Zero(t, site.dispatchDemand())
 }
