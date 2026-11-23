@@ -194,6 +194,9 @@ func dispatchBatteryPower(bb []dispatchBattery, demand, consumption float64) []*
 		if res[i] != nil {
 			dispatched = append(dispatched, i)
 			*res[i] += b.pv
+			if b.maxDischarge > 0 {
+				*res[i] = min(*res[i], b.maxDischarge)
+			}
 			ac += *res[i]
 			// a battery that cannot charge passes its own pv through even if exported, so it isn't curtailed
 			if !b.allows(false) {

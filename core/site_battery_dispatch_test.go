@@ -285,6 +285,12 @@ func TestDispatchBatteryACPower(t *testing.T) {
 			800, // 500 discharge + 300 pv
 		},
 		{
+			"own pv beyond max discharge is stored",
+			[]dispatchBattery{regulating(55), controlled(55, 1000, normal)},
+			300, 1300,
+			800,
+		},
+		{
 			"own pv beyond consumption is stored",
 			// share 233 charge would feed 767, the self-regulating battery cannot store the export
 			[]dispatchBattery{regulating(55), controlled(55, 1000, normal)},
