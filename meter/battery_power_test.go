@@ -35,24 +35,21 @@ func TestMarstekBatteryPowerControl(t *testing.T) {
 
 func TestBatteryACPower(t *testing.T) {
 	for _, tc := range []struct {
-		name                                         string
-		power, pv, maxCharge, maxDischarge, minPower float64
-		ac                                           float64
+		name                                     string
+		power, maxCharge, maxDischarge, minPower float64
+		ac                                       float64
 	}{
-		{"discharge", 300, 0, 1500, 800, 100, 300},
-		{"discharge plus own pv", 300, 200, 1500, 800, 100, 500},
-		{"discharge limited", 700, 400, 1500, 800, 100, 800},
-		{"hold passes own pv through", 0, 250, 1500, 800, 100, 250},
-		{"charge", -1000, 0, 1500, 800, 100, -1000},
-		{"charge offset by own pv", -1000, 400, 1500, 800, 100, -600},
-		{"charge limited", -2000, 0, 1500, 800, 100, -1500},
-		{"below min power stops", 60, 0, 1500, 800, 100, 0},
-		{"rounded to 10W", 304, 0, 0, 0, 0, 300},
-		{"unlimited", 3000, 0, 0, 0, 0, 3000},
-		{"negative pv ignored", 300, -20, 0, 0, 0, 300},
+		{"discharge", 300, 1500, 800, 100, 300},
+		{"discharge limited", 1100, 1500, 800, 100, 800},
+		{"charge", -1000, 1500, 800, 100, -1000},
+		{"charge limited", -2000, 1500, 800, 100, -1500},
+		{"below min power stops", 60, 1500, 800, 100, 0},
+		{"charge below min power stops", -60, 1500, 800, 100, 0},
+		{"1W resolution", 304.4, 0, 0, 0, 304},
+		{"unlimited", 3000, 0, 0, 0, 3000},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.ac, batteryACPower(tc.power, tc.pv, tc.maxCharge, tc.maxDischarge, tc.minPower))
+			assert.Equal(t, tc.ac, batteryACPower(tc.power, tc.maxCharge, tc.maxDischarge, tc.minPower))
 		})
 	}
 }

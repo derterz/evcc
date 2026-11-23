@@ -19,6 +19,8 @@ const (
 	dispatchBalanceSpread = 0.1
 	// dispatchSwitchSpread is the scaled soc lead another battery needs to take over from a running one
 	dispatchSwitchSpread = 0.05
+	// dispatchFullSpread is the scaled soc range below full in which a battery increasingly passes its own pv through
+	dispatchFullSpread = 0.1
 )
 
 // dispatchBattery is one battery's input to the power dispatch
@@ -32,7 +34,8 @@ type dispatchBattery struct {
 	maxCharge    float64 // W, 0 = unlimited
 	maxDischarge float64 // W, 0 = unlimited
 	minPower     float64 // W, the device stops below
-	setpoint     float64 // W, last setpoint applied
+	pv           float64 // W, own pv passing through the AC side
+	setpoint     float64 // W, last battery side setpoint applied
 }
 
 // scaledSoc returns the soc rescaled to the range between min and max soc, 0..1
@@ -68,6 +71,14 @@ func (b dispatchBattery) maxPower(discharging bool) float64 {
 	return b.maxCharge
 }
 
+// fullness ramps from 0 to 1 within dispatchFullSpread below full, 1 if the battery cannot charge
+func (b dispatchBattery) fullness() float64 {
+	if !b.allows(false) {
+		return 1
+	}
+	return max(0, min(1, (b.scaledSoc()-1+dispatchFullSpread)/dispatchFullSpread))
+}
+
 // priority orders the batteries to fill: fullest first when discharging, emptiest first when charging.
 // A running battery keeps its place until another leads by dispatchSwitchSpread.
 func (b dispatchBattery) priority(discharging bool) float64 {
@@ -84,8 +95,8 @@ func (b dispatchBattery) priority(discharging bool) float64 {
 // dispatchBatteryPower splits the demand the batteries cover together, positive = discharge, between
 // the batteries able to take it and fills the controlled batteries' part into as few of them as possible.
 // The self-regulating batteries take the remainder.
-// Returns the setpoint per battery, nil for batteries that are not dispatched.
-func dispatchBatteryPower(bb []dispatchBattery, demand float64) []*float64 {
+// Returns the AC setpoint per battery, nil for batteries that are not dispatched.
+func dispatchBatteryPower(bb []dispatchBattery, demand, consumption float64) []*float64 {
 	res := make([]*float64, len(bb))
 
 	// like the site soc, weigh by capacity only if all capacities are known
@@ -144,63 +155,134 @@ func dispatchBatteryPower(bb []dispatchBattery, demand float64) []*float64 {
 	})
 
 	for _, i := range candidates {
+		b := bb[i]
+
 		p := total
-		if limit := bb[i].maxPower(discharging); limit > 0 {
+		if limit := b.maxPower(discharging); limit > 0 {
+			// the limits apply on the AC side, where the own pv adds to discharging and offsets charging
+			if discharging {
+				limit -= b.pv
+			} else {
+				limit += b.pv
+			}
 			p = min(p, limit)
+		}
+		if p <= 0 {
+			continue
+		}
+
+		signed := p
+		if !discharging {
+			signed = -p
 		}
 
 		// too small to run this inverter, a later one or the self-regulating batteries take it
-		if p < bb[i].minPower || p <= 0 {
+		if math.Abs(signed+b.pv) < b.minPower {
 			continue
 		}
 
 		total -= p
-		if !discharging {
-			p = -p
+		*res[i] = signed
+	}
+
+	// AC side
+	var ac, allowed float64
+	var dispatched []int
+	for i, b := range bb {
+		if res[i] != nil {
+			dispatched = append(dispatched, i)
+			*res[i] += b.pv
+			ac += *res[i]
+			// near full the own pv is passed through even if exported, so it isn't curtailed
+			allowed += b.fullness() * max(0, b.pv)
 		}
-		*res[i] = p
+	}
+
+	// the self-regulating batteries only charge from their own pv, AC beyond the consumption would be exported
+	excess := ac - consumption - allowed
+
+	slices.SortStableFunc(dispatched, func(i, j int) int {
+		return cmp.Compare(bb[j].priority(false), bb[i].priority(false))
+	})
+
+	for _, i := range dispatched {
+		if excess <= 0 {
+			break
+		}
+
+		b := bb[i]
+		if !b.allows(false) {
+			continue
+		}
+
+		lower := math.Inf(-1)
+		if b.maxCharge > 0 {
+			lower = -b.maxCharge
+		}
+
+		red := min(excess, *res[i]-lower)
+		if red <= 0 {
+			continue
+		}
+
+		*res[i] -= red
+		excess -= red
+
+		if math.Abs(*res[i]) < b.minPower {
+			*res[i] = 0
+		}
 	}
 
 	return res
 }
 
-type timedPower struct {
-	ts    time.Time
-	power float64
+type demandSample struct {
+	ts          time.Time
+	demand      float64
+	consumption float64
 }
 
-// recordDemand adds a demand sample to the dispatch window
-func (site *Site) recordDemand(now time.Time, power float64) {
-	site.demandWindow = append(site.demandWindow, timedPower{now, power})
-	site.demandWindow = slices.DeleteFunc(site.demandWindow, func(s timedPower) bool {
+// recordDemand adds a sample of the demand the batteries cover and the consumption to the dispatch window
+func (site *Site) recordDemand(now time.Time, demand, consumption float64) {
+	site.demandWindow = append(site.demandWindow, demandSample{now, demand, consumption})
+	site.demandWindow = slices.DeleteFunc(site.demandWindow, func(s demandSample) bool {
 		return now.Sub(s.ts) > dispatchWindow
 	})
 }
 
+// percentiles returns the low and high percentile of the values
+func percentiles(vals []float64) (float64, float64) {
+	slices.Sort(vals)
+	n := float64(len(vals) - 1)
+	return vals[int(math.Floor(dispatchPercentile*n))], vals[int(math.Ceil((1-dispatchPercentile)*n))]
+}
+
 // dispatchDemand returns the demand the batteries can cover without exporting or importing within the
 // window: the low percentile if it's a deficit, the high percentile if it's a surplus, else zero.
-func (site *Site) dispatchDemand() float64 {
+// Also returns the low percentile of consumption, the AC power that can be fed in without exporting.
+func (site *Site) dispatchDemand() (float64, float64) {
 	if len(site.demandWindow) == 0 {
-		return 0
+		return 0, 0
 	}
 
-	vals := make([]float64, 0, len(site.demandWindow))
+	demand := make([]float64, 0, len(site.demandWindow))
+	consumption := make([]float64, 0, len(site.demandWindow))
 	for _, s := range site.demandWindow {
-		vals = append(vals, s.power)
+		demand = append(demand, s.demand)
+		consumption = append(consumption, s.consumption)
 	}
-	slices.Sort(vals)
 
-	n := float64(len(vals) - 1)
-	low := vals[int(math.Floor(dispatchPercentile*n))]
-	high := vals[int(math.Ceil((1-dispatchPercentile)*n))]
+	low, high := percentiles(demand)
+	minConsumption, _ := percentiles(consumption)
+	minConsumption = max(0, minConsumption)
 
 	switch {
 	case low > 0:
-		return low
+		return low, minConsumption
 	case high < 0:
-		return high
+		return high, minConsumption
 	default:
-		return 0
+		return 0, minConsumption
 	}
 }
 
@@ -241,6 +323,14 @@ func (site *Site) dispatchBatteries() {
 			controlled = true
 
 			b.minPower = ctrl.MinBatteryPower()
+
+			// without its pv the AC setpoint is unknown, the device keeps its last setpoint
+			if pv, err := ctrl.BatteryPvPower(); err == nil {
+				b.pv = max(0, pv)
+			} else {
+				site.log.ERROR.Printf("battery %s pv power: %v", deviceTitleOrName(dev), err)
+				ctrls[i] = nil
+			}
 			b.setpoint = site.batterySetpoints[dev.Config().Name]
 
 			if bpl, ok := api.Cap[api.BatteryPowerLimiter](meter); ok {
@@ -257,10 +347,10 @@ func (site *Site) dispatchBatteries() {
 		return
 	}
 
-	demand := site.dispatchDemand()
+	demand, consumption := site.dispatchDemand()
 
-	for i, p := range dispatchBatteryPower(bb, demand) {
-		if p == nil {
+	for i, p := range dispatchBatteryPower(bb, demand, consumption) {
+		if p == nil || ctrls[i] == nil {
 			continue
 		}
 
@@ -275,8 +365,8 @@ func (site *Site) dispatchBatteries() {
 		if site.batterySetpoints == nil {
 			site.batterySetpoints = make(map[string]float64)
 		}
-		site.batterySetpoints[dev.Config().Name] = *p
+		site.batterySetpoints[dev.Config().Name] = *p - bb[i].pv
 
-		site.log.DEBUG.Printf("battery %s power setpoint: %.0fW (demand %.0fW)", deviceTitleOrName(dev), *p, demand)
+		site.log.DEBUG.Printf("battery %s AC power setpoint: %.0fW (pv %.0fW, demand %.0fW, consumption %.0fW)", deviceTitleOrName(dev), *p, bb[i].pv, demand, consumption)
 	}
 }

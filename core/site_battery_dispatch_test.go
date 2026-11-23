@@ -239,7 +239,7 @@ func TestDispatchBatteryPower(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			res := dispatchBatteryPower(tc.bb, tc.demand)
+			res := dispatchBatteryPower(tc.bb, tc.demand, 5000)
 			assert.Len(t, res, len(tc.res))
 			for i := range tc.res {
 				if tc.res[i] == nil {
@@ -254,30 +254,117 @@ func TestDispatchBatteryPower(t *testing.T) {
 	}
 }
 
+func TestDispatchBatteryACPower(t *testing.T) {
+	kostal := func(soc float64) dispatchBattery {
+		return dispatchBattery{mode: api.BatteryNormal, soc: new(soc), minSoc: 10, maxSoc: 100, capacity: 10}
+	}
+	marstek := func(soc, pv float64, mode api.BatteryMode) dispatchBattery {
+		return dispatchBattery{controlled: true, mode: mode, soc: new(soc), minSoc: 10, maxSoc: 100, capacity: 5, maxCharge: 1500, maxDischarge: 800, minPower: 100, pv: pv}
+	}
+	normal := api.BatteryNormal
+
+	for _, tc := range []struct {
+		name                string
+		bb                  []dispatchBattery
+		demand, consumption float64
+		ac                  float64
+	}{
+		{
+			"discharge adds own pv",
+			[]dispatchBattery{kostal(50), marstek(65, 200, normal)},
+			900, 1100,
+			800, // 600 discharge + 200 pv
+		},
+		{
+			"discharge limited on the AC side",
+			[]dispatchBattery{kostal(50), marstek(65, 300, normal)},
+			900, 1200,
+			800, // 500 discharge + 300 pv
+		},
+		{
+			"own pv beyond consumption is stored",
+			// share 233 charge would feed 767, the kostal cannot store the export
+			[]dispatchBattery{kostal(55), marstek(55, 1000, normal)},
+			-700, 300,
+			300,
+		},
+		{
+			"nearly full: own pv partly passed through",
+			[]dispatchBattery{kostal(95.5), marstek(95.5, 1000, normal)},
+			-700, 300,
+			767,
+		},
+		{
+			"full: own pv passed through",
+			[]dispatchBattery{kostal(100), marstek(100, 1000, normal)},
+			-700, 300,
+			1000,
+		},
+		{
+			"holddischarge passes own pv through",
+			[]dispatchBattery{kostal(50), marstek(65, 200, api.BatteryHoldDischarge)},
+			700, 900,
+			200,
+		},
+		{
+			"holddischarge stores own pv beyond consumption",
+			[]dispatchBattery{kostal(50), marstek(65, 600, api.BatteryHoldDischarge)},
+			0, 400,
+			400,
+		},
+		{
+			"kostal nearly full: marstek charges from the grid side",
+			[]dispatchBattery{kostal(95), marstek(50, 0, normal)},
+			-3000, 500,
+			-1500,
+		},
+		{
+			"charge offset by own pv",
+			[]dispatchBattery{kostal(60), marstek(45, 400, normal)},
+			-1200, 300,
+			-400, // 800 charge - 400 pv
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res := dispatchBatteryPower(tc.bb, tc.demand, tc.consumption)
+			if assert.NotNil(t, res[1]) {
+				assert.InDelta(t, tc.ac, *res[1], 1)
+			}
+		})
+	}
+}
+
 func TestDispatchDemand(t *testing.T) {
 	record := func(vals ...float64) *Site {
 		site := &Site{}
 		now := time.Now()
 		for i, p := range vals {
-			site.recordDemand(now.Add(time.Duration(i)*30*time.Second), p)
+			site.recordDemand(now.Add(time.Duration(i)*30*time.Second), p, 1000+p)
 		}
 		return site
 	}
 
-	assert.Zero(t, (&Site{}).dispatchDemand())
+	demand, consumption := (&Site{}).dispatchDemand()
+	assert.Zero(t, demand)
+	assert.Zero(t, consumption)
 
 	// samples older than the window are dropped
 	site := record(900, 300, 2500, 400, 350, 800, 600, 500, 700, 450, 3000, 650)
 	assert.Len(t, site.demandWindow, 11)
 
 	// deficit: low percentile, short load peaks do not raise it
-	assert.Equal(t, 350.0, site.dispatchDemand())
+	demand, consumption = site.dispatchDemand()
+	assert.Equal(t, 350.0, demand)
+	assert.Equal(t, 1350.0, consumption)
 
 	// surplus: high percentile, short pv peaks do not raise it
 	site = record(-800, -1200, -300, -900, -1000, -700, -1100, -600, -950, -850, -750)
-	assert.Equal(t, -600.0, site.dispatchDemand())
+	demand, consumption = site.dispatchDemand()
+	assert.Equal(t, -600.0, demand)
+	assert.Equal(t, 0.0, consumption) // low percentile -1100 + 1000, not negative
 
 	// fluctuating around zero
 	site = record(-800, -500, -300, 200, 400, 600, -100, 300, -200, 500, 100)
-	assert.Zero(t, site.dispatchDemand())
+	demand, _ = site.dispatchDemand()
+	assert.Zero(t, demand)
 }
