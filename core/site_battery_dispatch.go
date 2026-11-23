@@ -71,12 +71,17 @@ func (b dispatchBattery) maxPower(discharging bool) float64 {
 	return b.maxCharge
 }
 
-// fullness ramps from 0 to 1 within dispatchFullSpread below full, 1 if the battery cannot charge
+// nearFull ramps from 0 to 1 within dispatchFullSpread below full
+func (b dispatchBattery) nearFull() float64 {
+	return max(0, min(1, (b.scaledSoc()-1+dispatchFullSpread)/dispatchFullSpread))
+}
+
+// fullness is nearFull, or 1 if the battery cannot charge
 func (b dispatchBattery) fullness() float64 {
 	if !b.allows(false) {
 		return 1
 	}
-	return max(0, min(1, (b.scaledSoc()-1+dispatchFullSpread)/dispatchFullSpread))
+	return b.nearFull()
 }
 
 // priority orders the batteries to fill: fullest first when discharging, emptiest first when charging.
@@ -230,6 +235,13 @@ func dispatchBatteryPower(bb []dispatchBattery, demand, consumption float64) []*
 
 		if math.Abs(*res[i]) < b.minPower {
 			*res[i] = 0
+		}
+	}
+
+	// near full the own pv is curtailed and reads too low, feeding in more lets the pv rise to what is available
+	for _, i := range dispatched {
+		if b := bb[i]; b.allows(true) && b.nearFull() > 0 {
+			*res[i] = max(*res[i], b.nearFull()*b.maxDischarge)
 		}
 	}
 

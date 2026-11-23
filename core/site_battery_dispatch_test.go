@@ -139,10 +139,10 @@ func TestDispatchBatteryPower(t *testing.T) {
 			[]*float64{nil, new(0.0)},
 		},
 		{
-			"at max soc: no charge",
+			"at max soc: no charge, discharged so pv is not curtailed",
 			[]dispatchBattery{kostal(100), marstek(100, normal)},
 			-900,
-			[]*float64{nil, new(0.0)},
+			[]*float64{nil, new(800.0)},
 		},
 		{
 			"scaled soc respects different limits",
@@ -290,15 +290,33 @@ func TestDispatchBatteryACPower(t *testing.T) {
 		},
 		{
 			"nearly full: own pv partly passed through",
-			[]dispatchBattery{kostal(95.5), marstek(95.5, 1000, normal)},
-			-700, 300,
-			767,
+			[]dispatchBattery{kostal(95.5), marstek(95.5, 700, normal)},
+			-400, 300,
+			567, // 133 charge, below the cap lifted by half the pv
 		},
 		{
-			"full: own pv passed through",
-			[]dispatchBattery{kostal(100), marstek(100, 1000, normal)},
-			-700, 300,
-			1000,
+			"nearly full: discharged above curtailed pv",
+			[]dispatchBattery{kostal(95.5), marstek(95.5, 300, normal)},
+			0, 300,
+			400, // half of max discharge
+		},
+		{
+			"full: discharged at max power",
+			[]dispatchBattery{kostal(100), marstek(100, 300, normal)},
+			0, 300,
+			800,
+		},
+		{
+			"full in holddischarge: own pv passed through only",
+			[]dispatchBattery{kostal(100), marstek(100, 300, api.BatteryHoldDischarge)},
+			0, 200,
+			300,
+		},
+		{
+			"full while discharging: max power",
+			[]dispatchBattery{kostal(100), marstek(100, 200, normal)},
+			300, 500,
+			800,
 		},
 		{
 			"holddischarge passes own pv through",
