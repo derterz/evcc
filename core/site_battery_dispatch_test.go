@@ -9,11 +9,10 @@ import (
 )
 
 func TestDispatchBatteryPower(t *testing.T) {
-	// kostal is self-regulating, marstek takes setpoints
-	kostal := func(soc float64) dispatchBattery {
+	regulating := func(soc float64) dispatchBattery {
 		return dispatchBattery{mode: api.BatteryNormal, soc: new(soc), minSoc: 10, maxSoc: 100, capacity: 10}
 	}
-	marstek := func(soc float64, mode api.BatteryMode) dispatchBattery {
+	controlled := func(soc float64, mode api.BatteryMode) dispatchBattery {
 		return dispatchBattery{controlled: true, mode: mode, soc: new(soc), minSoc: 10, maxSoc: 100, capacity: 5, maxCharge: 1500, maxDischarge: 800}
 	}
 	withMode := func(b dispatchBattery, mode api.BatteryMode) dispatchBattery {
@@ -38,202 +37,202 @@ func TestDispatchBatteryPower(t *testing.T) {
 	}{
 		{
 			"equal soc discharge: share by capacity",
-			[]dispatchBattery{kostal(55), marstek(55, normal)},
+			[]dispatchBattery{regulating(55), controlled(55, normal)},
 			900,
 			[]*float64{nil, new(300.0)},
 		},
 		{
-			"marstek fuller: discharges double share",
-			[]dispatchBattery{kostal(50), marstek(65, normal)},
+			"controlled fuller: discharges double share",
+			[]dispatchBattery{regulating(50), controlled(65, normal)},
 			900,
 			[]*float64{nil, new(600.0)},
 		},
 		{
-			"marstek emptier: no discharge",
-			[]dispatchBattery{kostal(60), marstek(45, normal)},
+			"controlled emptier: no discharge",
+			[]dispatchBattery{regulating(60), controlled(45, normal)},
 			900,
 			[]*float64{nil, new(0.0)},
 		},
 		{
-			"kostal empty: marstek covers the import",
-			[]dispatchBattery{kostal(10), marstek(65, normal)},
+			"self-regulating empty: controlled covers the import",
+			[]dispatchBattery{regulating(10), controlled(65, normal)},
 			900,
 			[]*float64{nil, new(800.0)}, // limited by max discharge
 		},
 		{
-			"marstek emptier: charges double share",
-			[]dispatchBattery{kostal(60), marstek(45, normal)},
+			"controlled emptier: charges double share",
+			[]dispatchBattery{regulating(60), controlled(45, normal)},
 			-1200,
 			[]*float64{nil, new(-800.0)},
 		},
 		{
-			"marstek fuller: no charge",
-			[]dispatchBattery{kostal(50), marstek(65, normal)},
+			"controlled fuller: no charge",
+			[]dispatchBattery{regulating(50), controlled(65, normal)},
 			-1200,
 			[]*float64{nil, new(0.0)},
 		},
 		{
-			"kostal full: marstek takes the export",
-			[]dispatchBattery{kostal(100), marstek(50, normal)},
+			"self-regulating full: controlled takes the export",
+			[]dispatchBattery{regulating(100), controlled(50, normal)},
 			-1200,
 			[]*float64{nil, new(-1200.0)}, // capped at the surplus
 		},
 		{
 			"charge limited",
-			[]dispatchBattery{kostal(60), marstek(45, normal)},
+			[]dispatchBattery{regulating(60), controlled(45, normal)},
 			-3000,
 			[]*float64{nil, new(-1500.0)},
 		},
 		{
 			"no demand",
-			[]dispatchBattery{kostal(55), marstek(55, normal)},
+			[]dispatchBattery{regulating(55), controlled(55, normal)},
 			0,
 			[]*float64{nil, new(0.0)},
 		},
 		{
 			"holddischarge blocks discharge",
-			[]dispatchBattery{kostal(50), marstek(65, api.BatteryHoldDischarge)},
+			[]dispatchBattery{regulating(50), controlled(65, api.BatteryHoldDischarge)},
 			900,
 			[]*float64{nil, new(0.0)},
 		},
 		{
 			"holddischarge allows charge",
-			[]dispatchBattery{kostal(60), marstek(45, api.BatteryHoldDischarge)},
+			[]dispatchBattery{regulating(60), controlled(45, api.BatteryHoldDischarge)},
 			-1200,
 			[]*float64{nil, new(-800.0)},
 		},
 		{
 			"holdcharge blocks charge",
-			[]dispatchBattery{kostal(60), marstek(45, api.BatteryHoldCharge)},
+			[]dispatchBattery{regulating(60), controlled(45, api.BatteryHoldCharge)},
 			-1200,
 			[]*float64{nil, new(0.0)},
 		},
 		{
-			"held kostal: marstek takes its share",
-			[]dispatchBattery{withMode(kostal(55), api.BatteryHoldDischarge), marstek(55, normal)},
+			"held self-regulating: controlled takes its share",
+			[]dispatchBattery{withMode(regulating(55), api.BatteryHoldDischarge), controlled(55, normal)},
 			900,
 			[]*float64{nil, new(800.0)}, // limited by max discharge
 		},
 		{
 			"unknown mode treated as normal",
-			[]dispatchBattery{kostal(55), marstek(55, api.BatteryUnknown)},
+			[]dispatchBattery{regulating(55), controlled(55, api.BatteryUnknown)},
 			900,
 			[]*float64{nil, new(300.0)},
 		},
 		{
 			"forced charge owns the device",
-			[]dispatchBattery{kostal(55), marstek(55, api.BatteryCharge)},
+			[]dispatchBattery{regulating(55), controlled(55, api.BatteryCharge)},
 			900,
 			[]*float64{nil, nil},
 		},
 		{
 			"forced discharge owns the device",
-			[]dispatchBattery{kostal(55), marstek(55, api.BatteryDischarge)},
+			[]dispatchBattery{regulating(55), controlled(55, api.BatteryDischarge)},
 			900,
 			[]*float64{nil, nil},
 		},
 		{
 			"at min soc: no discharge",
-			[]dispatchBattery{kostal(10), marstek(10, normal)},
+			[]dispatchBattery{regulating(10), controlled(10, normal)},
 			900,
 			[]*float64{nil, new(0.0)},
 		},
 		{
 			"at max soc: no charge, discharged so pv is not curtailed",
-			[]dispatchBattery{kostal(100), marstek(100, normal)},
+			[]dispatchBattery{regulating(100), controlled(100, normal)},
 			-900,
 			[]*float64{nil, new(800.0)},
 		},
 		{
 			"scaled soc respects different limits",
-			// kostal 55% of 10..100 = 0.5, marstek 60% of 20..100 = 0.5
-			[]dispatchBattery{kostal(55), {controlled: true, mode: normal, soc: new(60.0), minSoc: 20, maxSoc: 100, capacity: 5}},
+			// self-regulating 55% of 10..100 = 0.5, controlled 60% of 20..100 = 0.5
+			[]dispatchBattery{regulating(55), {controlled: true, mode: normal, soc: new(60.0), minSoc: 20, maxSoc: 100, capacity: 5}},
 			900,
 			[]*float64{nil, new(300.0)},
 		},
 		{
 			"missing capacity: equal weights",
-			[]dispatchBattery{{mode: normal, soc: new(55.0), minSoc: 10, maxSoc: 100}, marstek(55, normal)},
+			[]dispatchBattery{{mode: normal, soc: new(55.0), minSoc: 10, maxSoc: 100}, controlled(55, normal)},
 			900,
 			[]*float64{nil, new(450.0)},
 		},
 		{
 			"missing capacity: still balanced against the self-regulating battery",
-			[]dispatchBattery{{mode: normal, soc: new(50.0), minSoc: 10, maxSoc: 100}, marstek(65, normal)},
+			[]dispatchBattery{{mode: normal, soc: new(50.0), minSoc: 10, maxSoc: 100}, controlled(65, normal)},
 			900,
 			[]*float64{nil, new(800.0)}, // 825 limited by max discharge
 		},
 		{
 			"missing soc: not dispatched",
-			[]dispatchBattery{kostal(55), {controlled: true, mode: normal, capacity: 5}},
+			[]dispatchBattery{regulating(55), {controlled: true, mode: normal, capacity: 5}},
 			900,
 			[]*float64{nil, nil},
 		},
 		{
 			"below min power: stopped",
-			[]dispatchBattery{kostal(55), withMinPower(marstek(55, normal), 100)},
+			[]dispatchBattery{regulating(55), withMinPower(controlled(55, normal), 100)},
 			200,
 			[]*float64{nil, new(0.0)},
 		},
 		{
 			"charge below min power: stopped",
-			[]dispatchBattery{kostal(55), withMinPower(marstek(55, normal), 100)},
+			[]dispatchBattery{regulating(55), withMinPower(controlled(55, normal), 100)},
 			-200,
 			[]*float64{nil, new(0.0)},
 		},
 		{
 			"three batteries: small demand runs one inverter",
 			// 69 each would both be below min power
-			[]dispatchBattery{kostal(50), withMinPower(marstek(65, normal), 100), withMinPower(marstek(65, normal), 100)},
+			[]dispatchBattery{regulating(50), withMinPower(controlled(65, normal), 100), withMinPower(controlled(65, normal), 100)},
 			150,
 			[]*float64{nil, new(137.5), new(0.0)},
 		},
 		{
 			"three batteries: equal soc consolidated into one",
-			[]dispatchBattery{kostal(55), withMinPower(marstek(55, normal), 100), withMinPower(marstek(55, normal), 100)},
+			[]dispatchBattery{regulating(55), withMinPower(controlled(55, normal), 100), withMinPower(controlled(55, normal), 100)},
 			1200,
 			[]*float64{nil, new(600.0), new(0.0)},
 		},
 		{
 			"three batteries: overflow beyond max power to the next",
-			// scaled soc 0.5, 0.6 and 0.4, the fuller marstek's share of 1000 exceeds its max discharge
-			[]dispatchBattery{kostal(55), marstek(64, normal), marstek(46, normal)},
+			// scaled soc 0.5, 0.6 and 0.4, the fuller controlled battery's share of 1000 exceeds its max discharge
+			[]dispatchBattery{regulating(55), controlled(64, normal), controlled(46, normal)},
 			2000,
 			[]*float64{nil, new(800.0), new(200.0)},
 		},
 		{
 			"three batteries: fullest discharges",
-			[]dispatchBattery{kostal(55), marstek(54, normal), marstek(56, normal)},
+			[]dispatchBattery{regulating(55), controlled(54, normal), controlled(56, normal)},
 			1200,
 			[]*float64{nil, new(0.0), new(600.0)},
 		},
 		{
 			"three batteries: emptiest charges",
-			[]dispatchBattery{kostal(55), marstek(54, normal), marstek(56, normal)},
+			[]dispatchBattery{regulating(55), controlled(54, normal), controlled(56, normal)},
 			-1200,
 			[]*float64{nil, new(-600.0), new(0.0)},
 		},
 		{
 			"three batteries: running battery kept within switch spread",
-			[]dispatchBattery{kostal(55), withSetpoint(marstek(54, normal), 600), marstek(57, normal)},
+			[]dispatchBattery{regulating(55), withSetpoint(controlled(54, normal), 600), controlled(57, normal)},
 			1200,
 			[]*float64{nil, new(617.0), new(0.0)}, // shares 258 + 358
 		},
 		{
 			"three batteries: switched over beyond switch spread",
-			[]dispatchBattery{kostal(55), withSetpoint(marstek(52, normal), 600), marstek(58, normal)},
+			[]dispatchBattery{regulating(55), withSetpoint(controlled(52, normal), 600), controlled(58, normal)},
 			1200,
 			[]*float64{nil, new(0.0), new(600.0)},
 		},
 		{
 			"three batteries: running charge does not hold discharge",
-			[]dispatchBattery{kostal(55), withSetpoint(marstek(54, normal), -600), marstek(56, normal)},
+			[]dispatchBattery{regulating(55), withSetpoint(controlled(54, normal), -600), controlled(56, normal)},
 			1200,
 			[]*float64{nil, new(0.0), new(600.0)},
 		},
 		{
 			"three batteries: held battery's share goes to the others",
-			[]dispatchBattery{kostal(55), marstek(60, api.BatteryHoldDischarge), marstek(55, normal)},
+			[]dispatchBattery{regulating(55), controlled(60, api.BatteryHoldDischarge), controlled(55, normal)},
 			1200,
 			[]*float64{nil, new(0.0), new(344.0)},
 		},
@@ -255,10 +254,10 @@ func TestDispatchBatteryPower(t *testing.T) {
 }
 
 func TestDispatchBatteryACPower(t *testing.T) {
-	kostal := func(soc float64) dispatchBattery {
+	regulating := func(soc float64) dispatchBattery {
 		return dispatchBattery{mode: api.BatteryNormal, soc: new(soc), minSoc: 10, maxSoc: 100, capacity: 10}
 	}
-	marstek := func(soc, pv float64, mode api.BatteryMode) dispatchBattery {
+	controlled := func(soc, pv float64, mode api.BatteryMode) dispatchBattery {
 		return dispatchBattery{controlled: true, mode: mode, soc: new(soc), minSoc: 10, maxSoc: 100, capacity: 5, maxCharge: 1500, maxDischarge: 800, minPower: 100, pv: pv}
 	}
 	withMaxSoc := func(b dispatchBattery, soc float64) dispatchBattery {
@@ -275,80 +274,80 @@ func TestDispatchBatteryACPower(t *testing.T) {
 	}{
 		{
 			"discharge adds own pv",
-			[]dispatchBattery{kostal(50), marstek(65, 200, normal)},
+			[]dispatchBattery{regulating(50), controlled(65, 200, normal)},
 			900, 1100,
 			800, // 600 discharge + 200 pv
 		},
 		{
 			"discharge limited on the AC side",
-			[]dispatchBattery{kostal(50), marstek(65, 300, normal)},
+			[]dispatchBattery{regulating(50), controlled(65, 300, normal)},
 			900, 1200,
 			800, // 500 discharge + 300 pv
 		},
 		{
 			"own pv beyond consumption is stored",
-			// share 233 charge would feed 767, the kostal cannot store the export
-			[]dispatchBattery{kostal(55), marstek(55, 1000, normal)},
+			// share 233 charge would feed 767, the self-regulating battery cannot store the export
+			[]dispatchBattery{regulating(55), controlled(55, 1000, normal)},
 			-700, 300,
 			300,
 		},
 		{
 			"nearly full below max soc: own pv beyond consumption stored",
-			[]dispatchBattery{kostal(99), marstek(99, 700, normal)},
+			[]dispatchBattery{regulating(99), controlled(99, 700, normal)},
 			-400, 300,
 			300,
 		},
 		{
 			"at max soc: own pv passed through",
-			[]dispatchBattery{kostal(90), withMaxSoc(marstek(90, 300, normal), 90)},
+			[]dispatchBattery{regulating(90), withMaxSoc(controlled(90, 300, normal), 90)},
 			0, 200,
 			300,
 		},
 		{
 			"above max soc: discharged above curtailed pv",
-			[]dispatchBattery{kostal(95), withMaxSoc(marstek(95, 300, normal), 90)},
+			[]dispatchBattery{regulating(95), withMaxSoc(controlled(95, 300, normal), 90)},
 			0, 300,
 			400, // half of max discharge
 		},
 		{
 			"full: discharged at max power",
-			[]dispatchBattery{kostal(100), marstek(100, 300, normal)},
+			[]dispatchBattery{regulating(100), controlled(100, 300, normal)},
 			0, 300,
 			800,
 		},
 		{
 			"full in holddischarge: own pv passed through only",
-			[]dispatchBattery{kostal(100), marstek(100, 300, api.BatteryHoldDischarge)},
+			[]dispatchBattery{regulating(100), controlled(100, 300, api.BatteryHoldDischarge)},
 			0, 200,
 			300,
 		},
 		{
 			"full while discharging: max power",
-			[]dispatchBattery{kostal(100), marstek(100, 200, normal)},
+			[]dispatchBattery{regulating(100), controlled(100, 200, normal)},
 			300, 500,
 			800,
 		},
 		{
 			"holddischarge passes own pv through",
-			[]dispatchBattery{kostal(50), marstek(65, 200, api.BatteryHoldDischarge)},
+			[]dispatchBattery{regulating(50), controlled(65, 200, api.BatteryHoldDischarge)},
 			700, 900,
 			200,
 		},
 		{
 			"holddischarge stores own pv beyond consumption",
-			[]dispatchBattery{kostal(50), marstek(65, 600, api.BatteryHoldDischarge)},
+			[]dispatchBattery{regulating(50), controlled(65, 600, api.BatteryHoldDischarge)},
 			0, 400,
 			400,
 		},
 		{
-			"kostal nearly full: marstek charges from the grid side",
-			[]dispatchBattery{kostal(95), marstek(50, 0, normal)},
+			"self-regulating nearly full: controlled charges from the grid side",
+			[]dispatchBattery{regulating(95), controlled(50, 0, normal)},
 			-3000, 500,
 			-1500,
 		},
 		{
 			"charge offset by own pv",
-			[]dispatchBattery{kostal(60), marstek(45, 400, normal)},
+			[]dispatchBattery{regulating(60), controlled(45, 400, normal)},
 			-1200, 300,
 			-400, // 800 charge - 400 pv
 		},
