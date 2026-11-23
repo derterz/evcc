@@ -261,6 +261,10 @@ func TestDispatchBatteryACPower(t *testing.T) {
 	marstek := func(soc, pv float64, mode api.BatteryMode) dispatchBattery {
 		return dispatchBattery{controlled: true, mode: mode, soc: new(soc), minSoc: 10, maxSoc: 100, capacity: 5, maxCharge: 1500, maxDischarge: 800, minPower: 100, pv: pv}
 	}
+	withMaxSoc := func(b dispatchBattery, soc float64) dispatchBattery {
+		b.maxSoc = soc
+		return b
+	}
 	normal := api.BatteryNormal
 
 	for _, tc := range []struct {
@@ -289,14 +293,20 @@ func TestDispatchBatteryACPower(t *testing.T) {
 			300,
 		},
 		{
-			"nearly full: own pv partly passed through",
-			[]dispatchBattery{kostal(95.5), marstek(95.5, 700, normal)},
+			"nearly full below max soc: own pv beyond consumption stored",
+			[]dispatchBattery{kostal(99), marstek(99, 700, normal)},
 			-400, 300,
-			567, // 133 charge, below the cap lifted by half the pv
+			300,
 		},
 		{
-			"nearly full: discharged above curtailed pv",
-			[]dispatchBattery{kostal(95.5), marstek(95.5, 300, normal)},
+			"at max soc: own pv passed through",
+			[]dispatchBattery{kostal(90), withMaxSoc(marstek(90, 300, normal), 90)},
+			0, 200,
+			300,
+		},
+		{
+			"above max soc: discharged above curtailed pv",
+			[]dispatchBattery{kostal(95), withMaxSoc(marstek(95, 300, normal), 90)},
 			0, 300,
 			400, // half of max discharge
 		},

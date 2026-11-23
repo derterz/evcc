@@ -19,8 +19,6 @@ const (
 	dispatchBalanceSpread = 0.1
 	// dispatchSwitchSpread is the scaled soc lead another battery needs to take over from a running one
 	dispatchSwitchSpread = 0.05
-	// dispatchFullSpread is the scaled soc range below full in which a battery increasingly passes its own pv through
-	dispatchFullSpread = 0.1
 )
 
 // dispatchBattery is one battery's input to the power dispatch
@@ -71,17 +69,16 @@ func (b dispatchBattery) maxPower(discharging bool) float64 {
 	return b.maxCharge
 }
 
-// nearFull ramps from 0 to 1 within dispatchFullSpread below full
-func (b dispatchBattery) nearFull() float64 {
-	return max(0, min(1, (b.scaledSoc()-1+dispatchFullSpread)/dispatchFullSpread))
-}
-
-// fullness is nearFull, or 1 if the battery cannot charge
-func (b dispatchBattery) fullness() float64 {
-	if !b.allows(false) {
+// aboveMaxSoc ramps from 0 at max soc to 1 at 100%
+func (b dispatchBattery) aboveMaxSoc() float64 {
+	switch {
+	case *b.soc >= 100:
 		return 1
+	case b.maxSoc >= 100:
+		return 0
+	default:
+		return max(0, min(1, (*b.soc-b.maxSoc)/(100-b.maxSoc)))
 	}
-	return b.nearFull()
 }
 
 // priority orders the batteries to fill: fullest first when discharging, emptiest first when charging.
@@ -198,8 +195,10 @@ func dispatchBatteryPower(bb []dispatchBattery, demand, consumption float64) []*
 			dispatched = append(dispatched, i)
 			*res[i] += b.pv
 			ac += *res[i]
-			// near full the own pv is passed through even if exported, so it isn't curtailed
-			allowed += b.fullness() * max(0, b.pv)
+			// a battery that cannot charge passes its own pv through even if exported, so it isn't curtailed
+			if !b.allows(false) {
+				allowed += b.pv
+			}
 		}
 	}
 
@@ -238,10 +237,10 @@ func dispatchBatteryPower(bb []dispatchBattery, demand, consumption float64) []*
 		}
 	}
 
-	// near full the own pv is curtailed and reads too low, feeding in more lets the pv rise to what is available
+	// above max soc the own pv is curtailed and reads too low, feeding in more lets the pv rise to what is available
 	for _, i := range dispatched {
-		if b := bb[i]; b.allows(true) && b.nearFull() > 0 {
-			*res[i] = max(*res[i], b.nearFull()*b.maxDischarge)
+		if b := bb[i]; b.allows(true) && b.aboveMaxSoc() > 0 {
+			*res[i] = max(*res[i], b.aboveMaxSoc()*b.maxDischarge)
 		}
 	}
 
