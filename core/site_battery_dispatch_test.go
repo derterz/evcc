@@ -19,6 +19,10 @@ func TestDispatchBatteryPower(t *testing.T) {
 		b.minPower = p
 		return b
 	}
+	running := func(b dispatchBattery) dispatchBattery {
+		b.running = true
+		return b
+	}
 	withMaxSoc := func(b dispatchBattery, soc float64) dispatchBattery {
 		b.maxSoc = soc
 		return b
@@ -192,11 +196,35 @@ func TestDispatchBatteryPower(t *testing.T) {
 			[]*float64{nil, new(0.0)},
 		},
 		{
+			"running: kept down to min power",
+			[]dispatchBattery{regulating(55, 0), running(withMinPower(controlled(55, 0, normal), 100))},
+			360,
+			[]*float64{nil, new(120.0)},
+		},
+		{
+			"stopped: not started below start power",
+			[]dispatchBattery{regulating(55, 0), withMinPower(controlled(55, 0, normal), 100)},
+			360,
+			[]*float64{nil, new(0.0)},
+		},
+		{
+			"stopped: started above start power",
+			[]dispatchBattery{regulating(55, 0), withMinPower(controlled(55, 0, normal), 100)},
+			450,
+			[]*float64{nil, new(150.0)},
+		},
+		{
 			"three batteries: small demand runs one inverter",
-			// 69 each would both be below min power
+			// 92 each would both be below start power
 			[]dispatchBattery{regulating(50, 0), withMinPower(controlled(65, 0, normal), 100), withMinPower(controlled(65, 0, normal), 100)},
+			200,
+			[]*float64{nil, new(0.0), new(169.2)},
+		},
+		{
+			"three batteries: running inverter keeps running",
+			[]dispatchBattery{regulating(50, 0), running(withMinPower(controlled(65, 0, normal), 100)), withMinPower(controlled(65, 0, normal), 100)},
 			150,
-			[]*float64{nil, new(0.0), new(126.9)},
+			[]*float64{nil, new(126.9), new(0.0)},
 		},
 		{
 			"three batteries: equal soc shared",

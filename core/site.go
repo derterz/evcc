@@ -121,6 +121,7 @@ type Site struct {
 	batteryModeExternalTimer time.Time                  // Battery mode timer for external control
 	batteryModeApplied       map[string]api.BatteryMode // Battery mode last applied per battery meter
 	demandWindow             []demandSample             // Demand history for battery dispatch
+	batteryRunning           map[string]bool            // Battery inverters running with the last setpoint
 
 	optimizer optimizerState // optimizer runs, cached results and suggestions
 

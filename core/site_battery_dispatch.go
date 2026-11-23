@@ -16,6 +16,8 @@ const (
 	dispatchPercentile = 0.1
 	// dispatchBalanceSpread is the scaled soc difference at which balancing reaches full effect
 	dispatchBalanceSpread = 0.1
+	// dispatchStartFactor of min power a stopped inverter needs to start, a running one keeps running down to min power
+	dispatchStartFactor = 1.5
 )
 
 // dispatchBattery is one battery's input to the power dispatch, powers are AC side
@@ -30,6 +32,15 @@ type dispatchBattery struct {
 	maxDischarge float64 // W, 0 = unlimited
 	minPower     float64 // W, the device stops below
 	pv           float64 // W, own pv passing through the AC side
+	running      bool    // the inverter runs with the last setpoint
+}
+
+// startPower returns the AC power the inverter needs to run
+func (b dispatchBattery) startPower() float64 {
+	if b.running {
+		return b.minPower
+	}
+	return b.minPower * dispatchStartFactor
 }
 
 // scaledSoc returns the soc rescaled to the range between min and max soc, 0..1
@@ -137,11 +148,11 @@ func dispatchBatteryPower(bb []dispatchBattery, demand float64) []*float64 {
 	for {
 		ac = distributeBatteryPower(bb, active, stopped, total, weight, meanSoc)
 
-		// stop the controlled battery furthest below its min power
+		// stop the controlled battery furthest below its start power
 		worst, margin := -1, 0.0
 		for _, i := range active {
 			if b := bb[i]; b.controlled && !stopped[i] {
-				if m := math.Abs(ac[i]) - b.minPower; worst < 0 || m < margin {
+				if m := math.Abs(ac[i]) - b.startPower(); worst < 0 || m < margin {
 					worst, margin = i, m
 				}
 			}
@@ -305,6 +316,7 @@ func (site *Site) dispatchBatteries() {
 		if ctrl, ok := api.Cap[api.BatteryPowerController](meter); ok {
 			b.controlled = true
 			b.minPower = ctrl.MinBatteryPower()
+			b.running = site.batteryRunning[dev.Config().Name]
 
 			// without its pv the AC setpoint is unknown, the device keeps its last setpoint
 			if pv, err := ctrl.BatteryPvPower(); err == nil {
@@ -345,6 +357,11 @@ func (site *Site) dispatchBatteries() {
 			}
 			continue
 		}
+
+		if site.batteryRunning == nil {
+			site.batteryRunning = make(map[string]bool)
+		}
+		site.batteryRunning[dev.Config().Name] = *p != 0
 
 		site.log.DEBUG.Printf("battery %s AC power setpoint: %.0fW (pv %.0fW, demand %.0fW)", deviceTitleOrName(dev), *p, bb[i].pv, demand)
 	}
