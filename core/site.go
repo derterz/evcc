@@ -121,7 +121,6 @@ type Site struct {
 	batteryModeExternalTimer time.Time                  // Battery mode timer for external control
 	batteryModeApplied       map[string]api.BatteryMode // Battery mode last applied per battery meter
 	demandWindow             []demandSample             // Demand history for battery dispatch
-	batterySetpoints         map[string]float64         // Battery power setpoint last applied per battery meter
 
 	optimizer optimizerState // optimizer runs, cached results and suggestions
 
@@ -1424,7 +1423,7 @@ func (site *Site) updatePower(lp updater, state siteState, totalChargePower floa
 	homePower = max(homePower, 0)
 	site.publish(keys.HomePower, homePower)
 	// what the batteries cover together, independent of how it is currently split between them
-	site.recordDemand(time.Now(), homePower+totalChargePower-max(0, state.pvPower), homePower+totalChargePower)
+	site.recordDemand(time.Now(), homePower+totalChargePower-max(0, state.pvPower))
 
 	if homePower > 0 {
 		if err := site.collectors[metrics.Home].AddEnergy(nil, nil, homePower); err != nil {
