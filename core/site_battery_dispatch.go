@@ -38,7 +38,7 @@ type dispatchBattery struct {
 	undercharged    float64 // 0 down to min soc, 1 at 0%
 	usableCapacity  float64 // kWh between min and max soc
 	capacityAssumed bool
-	pv              float64 // own pv passing through the AC side, for self-regulating batteries only known in sum
+	pv              float64 // own pv passing through the AC side
 	minAC           float64
 	maxAC           float64
 	limitsAssumed   bool
@@ -74,12 +74,8 @@ func newDispatchBattery(m types.Measurement, mode api.BatteryMode, defaultCapaci
 		b.undercharged = (minSoc - soc) / minSoc
 	}
 
-	capacity := defaultCapacity
-	if m.Capacity != nil && *m.Capacity > 0 {
-		capacity = *m.Capacity
-	} else {
-		b.capacityAssumed = true
-	}
+	capacity, known := measuredCapacity(m, defaultCapacity)
+	b.capacityAssumed = !known
 	b.usableCapacity = capacity * (maxSoc - minSoc) / 100
 
 	// a battery that must not discharge or charge passes its own pv through.
@@ -90,16 +86,19 @@ func newDispatchBattery(m types.Measurement, mode api.BatteryMode, defaultCapaci
 	}
 
 	b.minAC = -maxCharge
-	if !b.canCharge() {
+	if mode == api.BatteryHoldCharge || b.scaledSoc >= 1 {
 		b.minAC = min(b.maxAC, pv+b.overcharged*maxDischarge)
 	}
 
 	return b
 }
 
-// canCharge returns if mode and soc allow charging
-func (b dispatchBattery) canCharge() bool {
-	return b.mode != api.BatteryHoldCharge && b.scaledSoc < 1
+// measuredCapacity returns the battery's capacity, or defaultCapacity if unknown
+func measuredCapacity(m types.Measurement, defaultCapacity float64) (float64, bool) {
+	if m.Capacity != nil && *m.Capacity > 0 {
+		return *m.Capacity, true
+	}
+	return defaultCapacity, false
 }
 
 // preferred returns the power the battery feeds in by itself: its own pv within its limits
@@ -124,13 +123,12 @@ func averageCapacity(mm []types.Measurement) float64 {
 	return sum / float64(known)
 }
 
-// sumRegulating sums up the self-regulating batteries, they cannot be controlled individually.
-// pv is their pv, unknown per battery, which is passed through if none of them can charge.
-func sumRegulating(bb []dispatchBattery, pv float64) dispatchBattery {
-	res := dispatchBattery{name: "self-regulating", pv: pv, maxAC: pv}
+// sumRegulating sums up the self-regulating batteries, they cannot be controlled individually
+func sumRegulating(bb []dispatchBattery) dispatchBattery {
+	res := dispatchBattery{name: "self-regulating"}
 
-	full := true
 	for _, b := range bb {
+		res.pv += b.pv
 		res.minAC += b.minAC
 		res.usableCapacity += b.usableCapacity
 		res.scaledSoc += b.scaledSoc * b.usableCapacity
@@ -139,16 +137,11 @@ func sumRegulating(bb []dispatchBattery, pv float64) dispatchBattery {
 		res.maxAC += b.maxAC
 		res.capacityAssumed = res.capacityAssumed || b.capacityAssumed
 		res.limitsAssumed = res.limitsAssumed || b.limitsAssumed
-		full = full && !b.canCharge()
 	}
 
 	res.scaledSoc /= res.usableCapacity
 	res.overcharged /= res.usableCapacity
 	res.undercharged /= res.usableCapacity
-
-	if full {
-		res.minAC += pv
-	}
 
 	return res
 }
@@ -338,12 +331,20 @@ func (site *Site) dispatchBatteries() {
 	defaultCapacity := averageCapacity(devices)
 
 	// controlled batteries first, the self-regulating ones summed up last
-	var dispatched, regulating []dispatchBattery
+	var dispatched []dispatchBattery
 	var ctrls []api.BatteryPowerController
 	var devs []config.Device[api.Meter]
 
 	// pv not reported by a controlled battery belongs to the self-regulating ones
 	regulatingPv := max(0, state.pvPower)
+
+	type regulatingInput struct {
+		m             types.Measurement
+		mode          api.BatteryMode
+		maxDischarge  float64
+		limitsAssumed bool
+	}
+	var pending []regulatingInput
 
 	for i, dev := range site.batteryMeters {
 		meter := dev.Instance()
@@ -368,29 +369,22 @@ func (site *Site) dispatchBatteries() {
 		}
 
 		ctrl, controlled := api.Cap[api.BatteryPowerController](meter)
+		if !controlled {
+			// prepared once their pv is known
+			pending = append(pending, regulatingInput{m, mode, maxDischarge, !limitsKnown})
+			continue
+		}
 
-		// the self-regulating batteries' pv is only known for all of them together
-		pv := 0.0
-		if controlled {
-			if p, err := ctrl.BatteryPvPower(); err == nil {
-				pv = max(0, p)
-				regulatingPv -= pv
-			} else {
-				site.log.ERROR.Printf("battery %s pv power: %v", deviceTitleOrName(dev), err)
-			}
+		var pv float64
+		if p, err := ctrl.BatteryPvPower(); err == nil {
+			pv = max(0, p)
+			regulatingPv -= pv
 		} else {
-			// self-regulating batteries charge from their own pv only
-			maxCharge = 0
+			site.log.ERROR.Printf("battery %s pv power: %v", deviceTitleOrName(dev), err)
 		}
 
 		b := newDispatchBattery(m, mode, defaultCapacity, maxCharge, maxDischarge, pv)
 		b.limitsAssumed = !limitsKnown
-
-		if !controlled {
-			regulating = append(regulating, b)
-			continue
-		}
-
 		b.minPower = ctrl.MinBatteryPower()
 		b.running = site.batteryRunning[dev.Config().Name]
 
@@ -403,9 +397,27 @@ func (site *Site) dispatchBatteries() {
 		return
 	}
 
+	// the self-regulating batteries' pv is only known in sum, it is split by capacity
+	var regulatingCapacity float64
+	for _, r := range pending {
+		c, _ := measuredCapacity(r.m, defaultCapacity)
+		regulatingCapacity += c
+	}
+
+	var regulating []dispatchBattery
+	for _, r := range pending {
+		c, _ := measuredCapacity(r.m, defaultCapacity)
+		pv := max(0, regulatingPv) * c / regulatingCapacity
+
+		// they charge from their own pv only, which passes the inverter in addition to the battery's discharge
+		b := newDispatchBattery(r.m, r.mode, defaultCapacity, 0, r.maxDischarge+pv, pv)
+		b.limitsAssumed = r.limitsAssumed
+		regulating = append(regulating, b)
+	}
+
 	rows := append(slices.Clone(dispatched), regulating...)
 	if len(regulating) > 0 {
-		sum := sumRegulating(regulating, max(0, regulatingPv))
+		sum := sumRegulating(regulating)
 		dispatched = append(dispatched, sum)
 		rows = append(rows, sum)
 	}

@@ -22,8 +22,9 @@ func measurement(soc, minSoc, maxSoc, capacity float64) types.Measurement {
 func TestDispatchBatteryPower(t *testing.T) {
 	normal := api.BatteryNormal
 
-	regulating := func(soc float64) dispatchBattery {
-		return newDispatchBattery(measurement(soc, 10, 100, 10), normal, 1, 0, 5000, 0)
+	// the self-regulating battery's pv passes the inverter in addition to its discharge
+	regulating := func(soc, pv float64) dispatchBattery {
+		return newDispatchBattery(measurement(soc, 10, 100, 10), normal, 1, 0, 5000+pv, pv)
 	}
 	controlled := func(soc, pv float64, mode api.BatteryMode) dispatchBattery {
 		return newDispatchBattery(measurement(soc, 10, 100, 5), mode, 1, 1500, 800, pv)
@@ -43,92 +44,96 @@ func TestDispatchBatteryPower(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		reg    dispatchBattery
-		regPv  float64
 		bb     []dispatchBattery
 		demand float64
 		res    []float64
 	}{
-		{"equal soc: discharge shared by capacity", regulating(55), 0, []dispatchBattery{controlled(55, 0, normal)}, 900, []float64{300}},
-		{"equal soc: charge from the self-regulating battery's pv", regulating(55), 1000, []dispatchBattery{controlled(55, 0, normal)}, -600, []float64{-200}},
-		{"no demand", regulating(55), 0, []dispatchBattery{controlled(55, 0, normal)}, 0, []float64{0}},
+		{"equal soc: discharge shared by capacity", regulating(55, 0), []dispatchBattery{controlled(55, 0, normal)}, 900, []float64{300}},
+		{"equal soc: charge from the self-regulating battery's pv", regulating(55, 1000), []dispatchBattery{controlled(55, 0, normal)}, -600, []float64{-200}},
+		{"no demand", regulating(55, 0), []dispatchBattery{controlled(55, 0, normal)}, 0, []float64{0}},
 		// scaled soc 0.5 and 0.6, mean 0.533: factors 6.67 and 8.33
-		{"controlled fuller: discharges more", regulating(55), 0, []dispatchBattery{controlled(64, 0, normal)}, 900, []float64{500}},
-		{"controlled emptier: no discharge", regulating(64), 0, []dispatchBattery{controlled(46, 0, normal)}, 900, []float64{0}},
+		{"controlled fuller: discharges more", regulating(55, 0), []dispatchBattery{controlled(64, 0, normal)}, 900, []float64{500}},
+		{"controlled emptier: no discharge", regulating(64, 0), []dispatchBattery{controlled(46, 0, normal)}, 900, []float64{0}},
 		// factors 3.33 and 10
-		{"controlled emptier: charges more", regulating(64), 1500, []dispatchBattery{controlled(46, 0, normal)}, -1200, []float64{-900}},
+		{"controlled emptier: charges more", regulating(64, 1500), []dispatchBattery{controlled(46, 0, normal)}, -1200, []float64{-900}},
 		{
 			"self-regulating output limited: controlled takes the rest",
-			newDispatchBattery(measurement(55, 10, 100, 10), normal, 1, 0, 500, 0), 0,
+			newDispatchBattery(measurement(55, 10, 100, 10), normal, 1, 0, 500, 0),
 			[]dispatchBattery{controlled(55, 0, normal)}, 900, []float64{400},
 		},
-		{"self-regulating empty: controlled covers the demand", regulating(10), 0, []dispatchBattery{controlled(65, 0, normal)}, 900, []float64{800}},
-		{"self-regulating at max soc: controlled takes the surplus", regulating(99), 1500, []dispatchBattery{controlled(50, 0, normal)}, -1200, []float64{-1200}},
+		{"self-regulating empty: controlled covers the demand", regulating(10, 0), []dispatchBattery{controlled(65, 0, normal)}, 900, []float64{800}},
+		{"self-regulating at max soc: controlled takes the surplus", regulating(99, 1500), []dispatchBattery{controlled(50, 0, normal)}, -1200, []float64{-1200}},
 		// at 100% the self-regulating battery is expected to discharge at max power
-		{"self-regulating at 100%: controlled charges at max power", regulating(100), 1500, []dispatchBattery{controlled(50, 0, normal)}, -1200, []float64{-1500}},
-		{"self-regulating nearly full: controlled charges at max power", regulating(95), 3500, []dispatchBattery{controlled(50, 0, normal)}, -3000, []float64{-1500}},
+		{"self-regulating at 100%: controlled charges at max power", regulating(100, 1500), []dispatchBattery{controlled(50, 0, normal)}, -1200, []float64{-1500}},
+		{
+			"self-regulating in holdcharge: controlled takes the surplus",
+			newDispatchBattery(measurement(50, 10, 100, 10), api.BatteryHoldCharge, 1, 0, 7000, 2000),
+			[]dispatchBattery{controlled(50, 0, normal)}, -1500, []float64{-1500},
+		},
+		{"self-regulating nearly full: controlled charges at max power", regulating(95, 3500), []dispatchBattery{controlled(50, 0, normal)}, -3000, []float64{-1500}},
 		// the self-regulating battery's share of the surplus would be AC charging
-		{"own pv beyond consumption is stored", regulating(55), 0, []dispatchBattery{controlled(55, 1000, normal)}, -700, []float64{300}},
-		{"own pv beyond max discharge is stored", regulating(55), 0, []dispatchBattery{controlled(55, 1000, normal)}, 300, []float64{800}},
-		{"holddischarge passes own pv through", regulating(50), 0, []dispatchBattery{controlled(65, 200, api.BatteryHoldDischarge)}, 700, []float64{200}},
-		{"holddischarge allows charge", regulating(64), 1500, []dispatchBattery{controlled(46, 0, api.BatteryHoldDischarge)}, -1200, []float64{-900}},
-		{"holdcharge passes own pv through", regulating(64), 1600, []dispatchBattery{controlled(46, 400, api.BatteryHoldCharge)}, -1200, []float64{400}},
-		{"unknown mode treated as normal", regulating(55), 0, []dispatchBattery{controlled(55, 0, api.BatteryUnknown)}, 900, []float64{300}},
+		{"own pv beyond consumption is stored", regulating(55, 0), []dispatchBattery{controlled(55, 1000, normal)}, -700, []float64{300}},
+		{"own pv beyond max discharge is stored", regulating(55, 0), []dispatchBattery{controlled(55, 1000, normal)}, 300, []float64{800}},
+		{"holddischarge passes own pv through", regulating(50, 0), []dispatchBattery{controlled(65, 200, api.BatteryHoldDischarge)}, 700, []float64{200}},
+		{"holddischarge allows charge", regulating(64, 1500), []dispatchBattery{controlled(46, 0, api.BatteryHoldDischarge)}, -1200, []float64{-900}},
+		{"holdcharge passes own pv through", regulating(64, 1600), []dispatchBattery{controlled(46, 400, api.BatteryHoldCharge)}, -1200, []float64{400}},
+		{"unknown mode treated as normal", regulating(55, 0), []dispatchBattery{controlled(55, 0, api.BatteryUnknown)}, 900, []float64{300}},
 		{
 			"assumed capacity: equal weights",
-			newDispatchBattery(measurement(55, 10, 100, 0), normal, 5, 0, 5000, 0), 0,
+			newDispatchBattery(measurement(55, 10, 100, 0), normal, 5, 0, 5000, 0),
 			[]dispatchBattery{controlled(55, 0, normal)}, 900, []float64{450},
 		},
 		{
 			// 55% of 10..100 and 60% of 20..100 are both 0.5, usable capacities 9 and 4 kWh
 			"usable capacity respects different limits",
-			regulating(55), 0,
+			regulating(55, 0),
 			[]dispatchBattery{newDispatchBattery(measurement(60, 20, 100, 5), normal, 1, 1500, 800, 0)}, 900, []float64{276.9},
 		},
-		{"at max soc: own pv passed through", regulating(90), 0, []dispatchBattery{controlledMaxSoc90(90, 300)}, -100, []float64{300}},
+		{"at max soc: own pv passed through", regulating(90, 0), []dispatchBattery{controlledMaxSoc90(90, 300)}, -100, []float64{300}},
 		// 300 pv + half of max discharge
-		{"above max soc: discharged on top of curtailed pv", regulating(95), 0, []dispatchBattery{controlledMaxSoc90(95, 300)}, 0, []float64{700}},
-		{"full: discharged at max power even if exported", regulating(100), 2000, []dispatchBattery{controlled(100, 0, normal)}, -900, []float64{800}},
-		{"full in holddischarge: own pv passed through only", regulating(100), 0, []dispatchBattery{controlled(100, 300, api.BatteryHoldDischarge)}, 0, []float64{300}},
-		{"below min power: stopped", regulating(55), 0, []dispatchBattery{withMinPower(controlled(55, 0, normal), 100)}, 200, []float64{0}},
-		{"charge below min power: stopped", regulating(55), 500, []dispatchBattery{withMinPower(controlled(55, 0, normal), 100)}, -200, []float64{0}},
-		{"running: kept down to min power", regulating(55), 0, []dispatchBattery{running(withMinPower(controlled(55, 0, normal), 100))}, 360, []float64{120}},
-		{"stopped: not started below start power", regulating(55), 0, []dispatchBattery{withMinPower(controlled(55, 0, normal), 100)}, 360, []float64{0}},
-		{"stopped: started above start power", regulating(55), 0, []dispatchBattery{withMinPower(controlled(55, 0, normal), 100)}, 450, []float64{150}},
+		{"above max soc: discharged on top of curtailed pv", regulating(95, 0), []dispatchBattery{controlledMaxSoc90(95, 300)}, 0, []float64{700}},
+		{"full: discharged at max power even if exported", regulating(100, 2000), []dispatchBattery{controlled(100, 0, normal)}, -900, []float64{800}},
+		{"full in holddischarge: own pv passed through only", regulating(100, 0), []dispatchBattery{controlled(100, 300, api.BatteryHoldDischarge)}, 0, []float64{300}},
+		{"below min power: stopped", regulating(55, 0), []dispatchBattery{withMinPower(controlled(55, 0, normal), 100)}, 200, []float64{0}},
+		{"charge below min power: stopped", regulating(55, 500), []dispatchBattery{withMinPower(controlled(55, 0, normal), 100)}, -200, []float64{0}},
+		{"running: kept down to min power", regulating(55, 0), []dispatchBattery{running(withMinPower(controlled(55, 0, normal), 100))}, 360, []float64{120}},
+		{"stopped: not started below start power", regulating(55, 0), []dispatchBattery{withMinPower(controlled(55, 0, normal), 100)}, 360, []float64{0}},
+		{"stopped: started above start power", regulating(55, 0), []dispatchBattery{withMinPower(controlled(55, 0, normal), 100)}, 450, []float64{150}},
 		{
 			// 92 each would both be below start power
 			"three batteries: small demand runs one inverter",
-			regulating(50), 0,
+			regulating(50, 0),
 			[]dispatchBattery{withMinPower(controlled(65, 0, normal), 100), withMinPower(controlled(65, 0, normal), 100)}, 200, []float64{0, 169.2},
 		},
 		{
 			"three batteries: running inverter keeps running",
-			regulating(50), 0,
+			regulating(50, 0),
 			[]dispatchBattery{running(withMinPower(controlled(65, 0, normal), 100)), withMinPower(controlled(65, 0, normal), 100)}, 150, []float64{126.9, 0},
 		},
 		{
 			"three batteries: equal soc shared",
-			regulating(55), 0,
+			regulating(55, 0),
 			[]dispatchBattery{withMinPower(controlled(55, 0, normal), 100), withMinPower(controlled(55, 0, normal), 100)}, 1200, []float64{300, 300},
 		},
 		{
 			// scaled soc 0.5, 0.6 and 0.4, the fuller controlled battery's share of 1000 exceeds its max discharge
 			"three batteries: beyond max power to the others",
-			regulating(55), 0,
+			regulating(55, 0),
 			[]dispatchBattery{controlled(64, 0, normal), controlled(46, 0, normal)}, 2000, []float64{800, 0},
 		},
 		{
 			"three batteries: emptier charges more",
-			regulating(55), 2000,
+			regulating(55, 2000),
 			[]dispatchBattery{controlled(54, 0, normal), controlled(56, 0, normal)}, -1200, []float64{-333.3, -266.7},
 		},
 		{
 			"three batteries: held battery's share goes to the others",
-			regulating(55), 0,
+			regulating(55, 0),
 			[]dispatchBattery{controlled(60, 0, api.BatteryHoldDischarge), controlled(55, 0, normal)}, 1200, []float64{0, 400},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			dispatched := append(slices.Clone(tc.bb), sumRegulating([]dispatchBattery{tc.reg}, tc.regPv))
+			dispatched := append(slices.Clone(tc.bb), sumRegulating([]dispatchBattery{tc.reg}))
 
 			res := dispatchBatteryPower(dispatched, tc.demand)
 			for i := range tc.res {
@@ -185,15 +190,15 @@ func TestAverageCapacity(t *testing.T) {
 }
 
 func TestSumRegulating(t *testing.T) {
-	battery := func(soc, capacity, maxDischarge float64, mode api.BatteryMode) dispatchBattery {
-		return newDispatchBattery(measurement(soc, 10, 100, capacity), mode, 1, 0, maxDischarge, 0)
+	battery := func(soc, capacity, maxDischarge, pv float64, mode api.BatteryMode) dispatchBattery {
+		return newDispatchBattery(measurement(soc, 10, 100, capacity), mode, 1, 0, maxDischarge+pv, pv)
 	}
 
 	// weighted by usable capacity, empty batteries add no output
 	r := sumRegulating([]dispatchBattery{
-		battery(55, 10, 3000, api.BatteryNormal),
-		battery(10, 5, 2000, api.BatteryNormal),
-	}, 500)
+		battery(55, 10, 3000, 500, api.BatteryNormal),
+		battery(10, 5, 2000, 0, api.BatteryNormal),
+	})
 	assert.InDelta(t, 13.5, r.usableCapacity, 1e-9)
 	assert.InDelta(t, 1.0/3, r.scaledSoc, 1e-9)
 	assert.Equal(t, 0.0, r.minAC)
@@ -202,9 +207,9 @@ func TestSumRegulating(t *testing.T) {
 
 	// none can charge: pv passed through, at 100% plus max discharge
 	r = sumRegulating([]dispatchBattery{
-		battery(100, 10, 2000, api.BatteryNormal),
-		battery(50, 10, 2000, api.BatteryHoldCharge),
-	}, 300)
+		battery(100, 10, 2000, 300, api.BatteryNormal),
+		battery(50, 10, 2000, 0, api.BatteryHoldCharge),
+	})
 	assert.Equal(t, 2300.0, r.minAC)
 	assert.Equal(t, 4300.0, r.maxAC)
 }
@@ -212,9 +217,9 @@ func TestSumRegulating(t *testing.T) {
 func TestDispatchTable(t *testing.T) {
 	ctrl := newDispatchBattery(measurement(50, 10, 90, 0), api.BatteryNormal, 1, 800, 800, 200)
 	ctrl.limitsAssumed = true
-	reg := newDispatchBattery(measurement(60, 10, 100, 10), api.BatteryNormal, 1, 0, 5000, 0)
+	reg := newDispatchBattery(measurement(60, 10, 100, 10), api.BatteryNormal, 1, 0, 6000, 1000)
 
-	table := dispatchTable([]dispatchBattery{ctrl, reg, sumRegulating([]dispatchBattery{reg}, 1000)})
+	table := dispatchTable([]dispatchBattery{ctrl, reg, sumRegulating([]dispatchBattery{reg})})
 	assert.Contains(t, table, "0.8*")  // assumed capacity, usable kWh
 	assert.Contains(t, table, "-800*") // assumed limits
 	assert.Contains(t, table, "self-regulating")
