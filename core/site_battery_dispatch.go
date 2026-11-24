@@ -88,21 +88,25 @@ func (b dispatchBattery) limits() (float64, float64) {
 		hi = min(hi, max(b.pv, lo))
 	}
 	if b.mode == api.BatteryHoldCharge || b.scaledSoc() >= 1 {
-		floor := b.pv
-		if b.controlled {
-			// a full battery curtails its pv and reads it too low, discharging lets the pv rise to what is available
-			floor += b.aboveMaxSoc() * b.maxDischarge
-		}
-		lo = max(lo, min(floor, hi))
+		lo = max(lo, min(b.feedIn(), hi))
 	}
 
 	return lo, hi
 }
 
-// preferred returns the AC power the battery feeds in by itself, its own pv within its limits
+// feedIn returns the own pv, for a controlled battery above max soc plus a discharge ramping up to max power.
+// A full battery curtails its pv and reads it too low, discharging lets the pv rise to what is available.
+func (b dispatchBattery) feedIn() float64 {
+	if !b.controlled {
+		return b.pv
+	}
+	return b.pv + b.aboveMaxSoc()*b.maxDischarge
+}
+
+// preferred returns the AC power the battery feeds in by itself within its limits
 func (b dispatchBattery) preferred() float64 {
 	lo, hi := b.limits()
-	return max(lo, min(hi, b.pv))
+	return max(lo, min(hi, b.feedIn()))
 }
 
 // dispatchBatteryPower distributes what the batteries feed in together, demand plus their own pv, as
