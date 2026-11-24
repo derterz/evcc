@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/evcc-io/evcc/api"
+	"github.com/evcc-io/evcc/util/config"
 )
 
 const (
@@ -22,7 +23,6 @@ const (
 
 // dispatchBattery is one battery's input to the power dispatch, powers are AC side
 type dispatchBattery struct {
-	controlled   bool            // accepts a power setpoint, otherwise self-regulating
 	mode         api.BatteryMode // mode applied to this battery
 	soc          *float64
 	minSoc       float64
@@ -69,52 +69,127 @@ func (b dispatchBattery) forced() bool {
 	return b.mode == api.BatteryCharge || b.mode == api.BatteryDischarge
 }
 
-// limits returns the AC power range the device limits, mode and soc allow, infinite if unlimited
-func (b dispatchBattery) limits() (float64, float64) {
+// canDischarge returns if mode and soc allow discharging
+func (b dispatchBattery) canDischarge() bool {
+	return b.mode != api.BatteryHoldDischarge && b.scaledSoc() > 0
+}
+
+// canCharge returns if mode and soc allow charging
+func (b dispatchBattery) canCharge() bool {
+	return b.mode != api.BatteryHoldCharge && b.scaledSoc() < 1
+}
+
+// feedIn returns the own pv, above max soc plus a discharge ramping up to max power.
+// A full battery curtails its pv and reads it too low, discharging lets the pv rise to what is available.
+func (b dispatchBattery) feedIn() float64 {
+	return b.pv + b.aboveMaxSoc()*b.maxDischarge
+}
+
+// share returns the battery's input to the distribution
+func (b dispatchBattery) share(weight float64) dispatchShare {
 	lo, hi := math.Inf(-1), math.Inf(1)
 	if b.maxCharge > 0 {
 		lo = -b.maxCharge
-	}
-	if !b.controlled {
-		// self-regulating batteries charge from their own pv only
-		lo = 0
 	}
 	if b.maxDischarge > 0 {
 		hi = b.maxDischarge
 	}
 
 	// a battery that must not discharge or charge passes its own pv through
-	if b.mode == api.BatteryHoldDischarge || b.scaledSoc() <= 0 {
+	if !b.canDischarge() {
 		hi = min(hi, max(b.pv, lo))
 	}
-	if b.mode == api.BatteryHoldCharge || b.scaledSoc() >= 1 {
+	if !b.canCharge() {
 		lo = max(lo, min(b.feedIn(), hi))
 	}
 
-	return lo, hi
-}
-
-// feedIn returns the own pv, for a controlled battery above max soc plus a discharge ramping up to max power.
-// A full battery curtails its pv and reads it too low, discharging lets the pv rise to what is available.
-func (b dispatchBattery) feedIn() float64 {
-	if !b.controlled {
-		return b.pv
+	return dispatchShare{
+		scaledSoc: b.scaledSoc(),
+		weight:    weight,
+		lo:        lo,
+		hi:        hi,
+		preferred: max(lo, min(hi, b.feedIn())),
 	}
-	return b.pv + b.aboveMaxSoc()*b.maxDischarge
 }
 
-// preferred returns the AC power the battery feeds in by itself within its limits
-func (b dispatchBattery) preferred() float64 {
-	lo, hi := b.limits()
-	return max(lo, min(hi, b.feedIn()))
+// dispatchRegulating sums up the self-regulating batteries, they cannot be controlled individually
+type dispatchRegulating struct {
+	capacity  float64  // kWh, 0 = unknown
+	scaledSoc *float64 // nil if none reports a soc
+	output    float64  // W, max discharge of the batteries able to discharge, infinite if unlimited
+	full      bool     // none can charge
+	pv        float64  // W, pv not reported by a controlled battery
+}
+
+// sumRegulating sums up the self-regulating batteries, batteries in a forced mode are left out
+func sumRegulating(bb []dispatchBattery, pv float64) dispatchRegulating {
+	res := dispatchRegulating{full: true, pv: pv}
+
+	weighted := !slices.ContainsFunc(bb, func(b dispatchBattery) bool { return b.capacity <= 0 })
+
+	var socWeight, socAcc float64
+	for _, b := range bb {
+		if b.soc == nil || b.forced() {
+			continue
+		}
+
+		w := 1.0
+		if weighted {
+			w = b.capacity
+			res.capacity += b.capacity
+		}
+		socWeight += w
+		socAcc += b.scaledSoc() * w
+
+		if b.canDischarge() {
+			if b.maxDischarge > 0 {
+				res.output += b.maxDischarge
+			} else {
+				res.output = math.Inf(1)
+			}
+		}
+		if b.canCharge() {
+			res.full = false
+		}
+	}
+
+	if socWeight > 0 {
+		res.scaledSoc = new(socAcc / socWeight)
+	}
+
+	return res
+}
+
+// share returns the self-regulating batteries' input to the distribution. They charge from their own pv only.
+func (r dispatchRegulating) share(weight float64) dispatchShare {
+	lo := 0.0
+	if r.full {
+		lo = r.pv
+	}
+
+	return dispatchShare{
+		scaledSoc: *r.scaledSoc,
+		weight:    weight,
+		lo:        lo,
+		hi:        r.pv + r.output,
+		preferred: r.pv,
+	}
+}
+
+// dispatchShare is an inverter's input to the distribution, AC side
+type dispatchShare struct {
+	scaledSoc float64
+	weight    float64
+	lo, hi    float64 // limits, infinite if unlimited
+	preferred float64 // power fed in by itself
 }
 
 // dispatchBatteryPower distributes what the batteries feed in together, demand plus their own pv, as
-// AC power. Each battery starts from its preferred power, the difference to the demand is split such that
-// the socs converge. Controlled batteries below min power are stopped one by one until all running ones
-// exceed it. The self-regulating batteries' part is not set, they take whatever is left.
+// AC power. Each inverter starts from its preferred power, the difference to the demand is split such that
+// the socs converge. Controlled batteries below start power are stopped one by one until all running ones
+// exceed it. The self-regulating batteries are not set, they take whatever is left.
 // Returns the AC setpoint per controlled battery, nil for batteries that are not dispatched.
-func dispatchBatteryPower(bb []dispatchBattery, demand float64) []*float64 {
+func dispatchBatteryPower(reg dispatchRegulating, bb []dispatchBattery, demand float64) []*float64 {
 	res := make([]*float64, len(bb))
 
 	var active []int
@@ -128,36 +203,38 @@ func dispatchBatteryPower(bb []dispatchBattery, demand float64) []*float64 {
 	}
 
 	// like the site soc, weigh by capacity only if all capacities are known
-	weighted := !slices.ContainsFunc(active, func(i int) bool { return bb[i].capacity <= 0 })
-	weight := func(b dispatchBattery) float64 {
+	weighted := (reg.scaledSoc == nil || reg.capacity > 0) && !slices.ContainsFunc(active, func(i int) bool { return bb[i].capacity <= 0 })
+	weight := func(capacity float64) float64 {
 		if weighted {
-			return b.capacity
+			return capacity
 		}
 		return 1
 	}
 
+	// controlled batteries first, the self-regulating ones last
+	shares := make([]dispatchShare, 0, len(active)+1)
 	total := demand
-	var socWeight, socAcc float64
 	for _, i := range active {
-		b := bb[i]
-		total += b.pv
-		socWeight += weight(b)
-		socAcc += b.scaledSoc() * weight(b)
+		shares = append(shares, bb[i].share(weight(bb[i].capacity)))
+		total += bb[i].pv
 	}
-	meanSoc := socAcc / socWeight
+	if reg.scaledSoc != nil {
+		shares = append(shares, reg.share(weight(reg.capacity)))
+		total += reg.pv
+	}
 
-	stopped := make([]bool, len(bb))
+	stopped := make([]bool, len(shares))
 	var ac []float64
 
 	for {
-		ac = distributeBatteryPower(bb, active, stopped, total, weight, meanSoc)
+		ac = distributeBatteryPower(shares, stopped, total)
 
 		// stop the controlled battery furthest below its start power
 		worst, margin := -1, 0.0
-		for _, i := range active {
-			if b := bb[i]; b.controlled && !stopped[i] {
-				if m := math.Abs(ac[i]) - b.startPower(); worst < 0 || m < margin {
-					worst, margin = i, m
+		for k, i := range active {
+			if !stopped[k] {
+				if m := math.Abs(ac[k]) - bb[i].startPower(); worst < 0 || m < margin {
+					worst, margin = k, m
 				}
 			}
 		}
@@ -168,65 +245,70 @@ func dispatchBatteryPower(bb []dispatchBattery, demand float64) []*float64 {
 		stopped[worst] = true
 	}
 
-	for _, i := range active {
-		if bb[i].controlled {
-			res[i] = new(ac[i])
-		}
+	for k, i := range active {
+		res[i] = new(ac[k])
 	}
 
 	return res
 }
 
-// distributeBatteryPower splits total between the batteries not stopped. Each starts from its preferred power,
-// the difference is split by weight shifted towards the batteries further from the mean soc in the direction of
-// the difference. Batteries reaching a limit stay there and the rest is split between the others.
-func distributeBatteryPower(bb []dispatchBattery, active []int, stopped []bool, total float64, weight func(dispatchBattery) float64, meanSoc float64) []float64 {
-	ac := make([]float64, len(bb))
+// distributeBatteryPower splits total between the inverters not stopped. Each starts from its preferred power,
+// the difference is split by weight shifted towards the inverters further from the mean soc in the direction of
+// the difference. Inverters reaching a limit stay there and the rest is split between the others.
+func distributeBatteryPower(shares []dispatchShare, stopped []bool, total float64) []float64 {
+	var socWeight, socAcc float64
+	for _, s := range shares {
+		socWeight += s.weight
+		socAcc += s.scaledSoc * s.weight
+	}
+	meanSoc := socAcc / socWeight
+
+	ac := make([]float64, len(shares))
 
 	var free []int
 	diff := total
-	for _, i := range active {
-		if stopped[i] {
+	for k, s := range shares {
+		if stopped[k] {
 			continue
 		}
-		ac[i] = bb[i].preferred()
-		diff -= ac[i]
-		free = append(free, i)
+		ac[k] = s.preferred
+		diff -= ac[k]
+		free = append(free, k)
 	}
 
-	// each round either distributes everything or pins at least one battery to its limit
+	// each round either distributes everything or pins at least one inverter to its limit
 	for len(free) > 0 && diff != 0 {
-		factor := make([]float64, len(bb))
+		factor := make([]float64, len(shares))
 		var sum float64
-		for _, i := range free {
-			b := bb[i]
-			balance := max(-1, min(1, (b.scaledSoc()-meanSoc)/dispatchBalanceSpread))
+		for _, k := range free {
+			s := shares[k]
+			balance := max(-1, min(1, (s.scaledSoc-meanSoc)/dispatchBalanceSpread))
 			if diff < 0 {
 				balance = -balance
 			}
-			factor[i] = weight(b) * (1 + balance)
-			sum += factor[i]
+			factor[k] = s.weight * (1 + balance)
+			sum += factor[k]
 		}
 
 		// all at the far end of the balance
 		if sum == 0 {
-			for _, i := range free {
-				factor[i] = weight(bb[i])
-				sum += factor[i]
+			for _, k := range free {
+				factor[k] = shares[k].weight
+				sum += factor[k]
 			}
 		}
 
 		var rest float64
 		var next []int
-		for _, i := range free {
-			lo, hi := bb[i].limits()
-			p := ac[i] + diff*factor[i]/sum
-			ac[i] = max(lo, min(hi, p))
+		for _, k := range free {
+			s := shares[k]
+			p := ac[k] + diff*factor[k]/sum
+			ac[k] = max(s.lo, min(s.hi, p))
 
-			if ac[i] != p {
-				rest += p - ac[i]
+			if ac[k] != p {
+				rest += p - ac[k]
 			} else {
-				next = append(next, i)
+				next = append(next, k)
 			}
 		}
 
@@ -284,12 +366,12 @@ func (site *Site) dispatchBatteries() {
 		return
 	}
 
-	bb := make([]dispatchBattery, len(site.batteryMeters))
-	ctrls := make([]api.BatteryPowerController, len(site.batteryMeters))
+	var controlled, regulating []dispatchBattery
+	var ctrls []api.BatteryPowerController
+	var devs []config.Device[api.Meter]
 
 	// pv not reported by a controlled battery is attributed to the self-regulating ones
 	regulatingPv := max(0, state.pvPower)
-	var regulating int
 
 	for i, dev := range site.batteryMeters {
 		meter := dev.Instance()
@@ -317,44 +399,42 @@ func (site *Site) dispatchBatteries() {
 			}
 		}
 
-		if ctrl, ok := api.Cap[api.BatteryPowerController](meter); ok {
-			b.controlled = true
-			b.minPower = ctrl.MinBatteryPower()
-			b.running = site.batteryRunning[dev.Config().Name]
-
-			// without its pv the AC setpoint is unknown, the device keeps its last setpoint
-			if pv, err := ctrl.BatteryPvPower(); err == nil {
-				ctrls[i] = ctrl
-				b.pv = max(0, pv)
-				regulatingPv -= b.pv
-			} else {
-				site.log.ERROR.Printf("battery %s pv power: %v", deviceTitleOrName(dev), err)
-			}
-		} else {
-			regulating++
-		}
-
-		bb[i] = b
-	}
-
-	if !slices.ContainsFunc(ctrls, func(c api.BatteryPowerController) bool { return c != nil }) {
-		return
-	}
-
-	for i := range bb {
-		if !bb[i].controlled && regulating > 0 {
-			bb[i].pv = max(0, regulatingPv) / float64(regulating)
-		}
-	}
-
-	demand := site.dispatchDemand()
-
-	for i, p := range dispatchBatteryPower(bb, demand) {
-		if p == nil || ctrls[i] == nil {
+		ctrl, ok := api.Cap[api.BatteryPowerController](meter)
+		if !ok {
+			regulating = append(regulating, b)
 			continue
 		}
 
-		dev := site.batteryMeters[i]
+		// without its pv the AC setpoint is unknown, the device keeps its last setpoint
+		pv, err := ctrl.BatteryPvPower()
+		if err != nil {
+			site.log.ERROR.Printf("battery %s pv power: %v", deviceTitleOrName(dev), err)
+			continue
+		}
+
+		b.pv = max(0, pv)
+		b.minPower = ctrl.MinBatteryPower()
+		b.running = site.batteryRunning[dev.Config().Name]
+		regulatingPv -= b.pv
+
+		controlled = append(controlled, b)
+		ctrls = append(ctrls, ctrl)
+		devs = append(devs, dev)
+	}
+
+	if len(controlled) == 0 {
+		return
+	}
+
+	demand := site.dispatchDemand()
+	reg := sumRegulating(regulating, max(0, regulatingPv))
+
+	for i, p := range dispatchBatteryPower(reg, controlled, demand) {
+		if p == nil {
+			continue
+		}
+
+		dev := devs[i]
 		if err := ctrls[i].SetBatteryPower(*p); err != nil {
 			if !errors.Is(err, api.ErrNotAvailable) {
 				site.log.ERROR.Printf("battery %s power: %v", deviceTitleOrName(dev), err)
@@ -367,6 +447,6 @@ func (site *Site) dispatchBatteries() {
 		}
 		site.batteryRunning[dev.Config().Name] = *p != 0
 
-		site.log.DEBUG.Printf("battery %s AC power setpoint: %.0fW (pv %.0fW, demand %.0fW)", deviceTitleOrName(dev), *p, bb[i].pv, demand)
+		site.log.DEBUG.Printf("battery %s AC power setpoint: %.0fW (pv %.0fW, demand %.0fW)", deviceTitleOrName(dev), *p, controlled[i].pv, demand)
 	}
 }
