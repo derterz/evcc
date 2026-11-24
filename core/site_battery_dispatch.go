@@ -38,7 +38,7 @@ type dispatchBattery struct {
 	undercharged    float64 // 0 down to min soc, 1 at 0%
 	usableCapacity  float64 // kWh between min and max soc
 	capacityAssumed bool
-	pv              float64 // own pv passing through the AC side, NaN if unknown
+	pv              float64 // own pv passing through the AC side, for self-regulating batteries only known in sum
 	minAC           float64
 	maxAC           float64
 	limitsAssumed   bool
@@ -48,14 +48,10 @@ type dispatchBattery struct {
 
 // newDispatchBattery prepares a battery with soc for the dispatch. defaultCapacity is used if the capacity
 // is unknown. maxCharge is the AC charge limit, 0 if the battery charges from its own pv only.
-// An unknown pv (NaN) counts as 0.
 func newDispatchBattery(m types.Measurement, mode api.BatteryMode, defaultCapacity, maxCharge, maxDischarge, pv float64) dispatchBattery {
 	b := dispatchBattery{name: m.Title, mode: mode, pv: pv}
 	if b.name == "" {
 		b.name = m.Name
-	}
-	if math.IsNaN(pv) {
-		pv = 0
 	}
 
 	soc, minSoc, maxSoc := *m.Soc, 0.0, 100.0
@@ -171,17 +167,14 @@ func dispatchTable(bb []dispatchBattery) string {
 	fmt.Fprintln(w, "battery\tmode\tscaled soc\tover\tunder\tcapacity kWh\tpv W\tmin W\tmax W\t")
 
 	for _, b := range bb {
-		mode, pv := "", "*"
+		mode := ""
 		if b.mode != api.BatteryUnknown {
 			mode = b.mode.String()
 		}
-		if !math.IsNaN(b.pv) {
-			pv = fmt.Sprintf("%.0f", b.pv)
-		}
 
-		fmt.Fprintf(w, "%s\t%s\t%.2f\t%.2f\t%.2f\t%s\t%s\t%s\t%s\t\n",
+		fmt.Fprintf(w, "%s\t%s\t%.2f\t%.2f\t%.2f\t%s\t%.0f\t%s\t%s\t\n",
 			b.name, mode, b.scaledSoc, b.overcharged, b.undercharged,
-			assumed("%.1f", b.usableCapacity, b.capacityAssumed), pv,
+			assumed("%.1f", b.usableCapacity, b.capacityAssumed), b.pv,
 			assumed("%.0f", b.minAC, b.limitsAssumed), assumed("%.0f", b.maxAC, b.limitsAssumed))
 	}
 
@@ -377,9 +370,8 @@ func (site *Site) dispatchBatteries() {
 		ctrl, controlled := api.Cap[api.BatteryPowerController](meter)
 
 		// the self-regulating batteries' pv is only known for all of them together
-		pv := math.NaN()
+		pv := 0.0
 		if controlled {
-			pv = 0
 			if p, err := ctrl.BatteryPvPower(); err == nil {
 				pv = max(0, p)
 				regulatingPv -= pv

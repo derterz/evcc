@@ -1,7 +1,6 @@
 package core
 
 import (
-	"math"
 	"slices"
 	"testing"
 	"time"
@@ -22,10 +21,9 @@ func measurement(soc, minSoc, maxSoc, capacity float64) types.Measurement {
 
 func TestDispatchBatteryPower(t *testing.T) {
 	normal := api.BatteryNormal
-	nan := math.NaN()
 
 	regulating := func(soc float64) dispatchBattery {
-		return newDispatchBattery(measurement(soc, 10, 100, 10), normal, 1, 0, 5000, nan)
+		return newDispatchBattery(measurement(soc, 10, 100, 10), normal, 1, 0, 5000, 0)
 	}
 	controlled := func(soc, pv float64, mode api.BatteryMode) dispatchBattery {
 		return newDispatchBattery(measurement(soc, 10, 100, 5), mode, 1, 1500, 800, pv)
@@ -60,7 +58,7 @@ func TestDispatchBatteryPower(t *testing.T) {
 		{"controlled emptier: charges more", regulating(64), 1500, []dispatchBattery{controlled(46, 0, normal)}, -1200, []float64{-900}},
 		{
 			"self-regulating output limited: controlled takes the rest",
-			newDispatchBattery(measurement(55, 10, 100, 10), normal, 1, 0, 500, nan), 0,
+			newDispatchBattery(measurement(55, 10, 100, 10), normal, 1, 0, 500, 0), 0,
 			[]dispatchBattery{controlled(55, 0, normal)}, 900, []float64{400},
 		},
 		{"self-regulating empty: controlled covers the demand", regulating(10), 0, []dispatchBattery{controlled(65, 0, normal)}, 900, []float64{800}},
@@ -77,7 +75,7 @@ func TestDispatchBatteryPower(t *testing.T) {
 		{"unknown mode treated as normal", regulating(55), 0, []dispatchBattery{controlled(55, 0, api.BatteryUnknown)}, 900, []float64{300}},
 		{
 			"assumed capacity: equal weights",
-			newDispatchBattery(measurement(55, 10, 100, 0), normal, 5, 0, 5000, nan), 0,
+			newDispatchBattery(measurement(55, 10, 100, 0), normal, 5, 0, 5000, 0), 0,
 			[]dispatchBattery{controlled(55, 0, normal)}, 900, []float64{450},
 		},
 		{
@@ -175,7 +173,7 @@ func TestNewDispatchBattery(t *testing.T) {
 	}
 
 	// unknown capacity and soc limits
-	b := newDispatchBattery(types.Measurement{Soc: new(50.0)}, api.BatteryNormal, 3, 1500, 800, math.NaN())
+	b := newDispatchBattery(types.Measurement{Soc: new(50.0)}, api.BatteryNormal, 3, 1500, 800, 0)
 	assert.True(t, b.capacityAssumed)
 	assert.Equal(t, 3.0, b.usableCapacity)
 	assert.Equal(t, 0.5, b.scaledSoc)
@@ -188,7 +186,7 @@ func TestAverageCapacity(t *testing.T) {
 
 func TestSumRegulating(t *testing.T) {
 	battery := func(soc, capacity, maxDischarge float64, mode api.BatteryMode) dispatchBattery {
-		return newDispatchBattery(measurement(soc, 10, 100, capacity), mode, 1, 0, maxDischarge, math.NaN())
+		return newDispatchBattery(measurement(soc, 10, 100, capacity), mode, 1, 0, maxDischarge, 0)
 	}
 
 	// weighted by usable capacity, empty batteries add no output
@@ -214,7 +212,7 @@ func TestSumRegulating(t *testing.T) {
 func TestDispatchTable(t *testing.T) {
 	ctrl := newDispatchBattery(measurement(50, 10, 90, 0), api.BatteryNormal, 1, 800, 800, 200)
 	ctrl.limitsAssumed = true
-	reg := newDispatchBattery(measurement(60, 10, 100, 10), api.BatteryNormal, 1, 0, 5000, math.NaN())
+	reg := newDispatchBattery(measurement(60, 10, 100, 10), api.BatteryNormal, 1, 0, 5000, 0)
 
 	table := dispatchTable([]dispatchBattery{ctrl, reg, sumRegulating([]dispatchBattery{reg}, 1000)})
 	assert.Contains(t, table, "0.8*")  // assumed capacity, usable kWh
