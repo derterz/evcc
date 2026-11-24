@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/evcc-io/evcc/api"
+	"github.com/evcc-io/evcc/core/types"
 	"github.com/evcc-io/evcc/util/config"
 )
 
@@ -30,138 +31,141 @@ const (
 
 // dispatchBattery is a battery prepared for the power dispatch, powers are AC side in W, positive = discharge
 type dispatchBattery struct {
-	// input
-	name         string
-	controlled   bool // accepts a power setpoint, otherwise self-regulating
-	mode         api.BatteryMode
-	soc          float64
-	minSoc       float64
-	maxSoc       float64
-	capacity     float64 // kWh, 0 = unknown
-	maxCharge    float64 // 0 = unknown
-	maxDischarge float64 // 0 = unknown
-	pv           float64 // own pv passing through the AC side, unknown for self-regulating batteries
-	minPower     float64 // the inverter stops below
-	running      bool    // the inverter runs with the last setpoint
-
-	// prepared
-	capacityAssumed bool
-	limitsAssumed   bool
+	name            string
+	controlled      bool // accepts a power setpoint, otherwise self-regulating
+	mode            api.BatteryMode
 	scaledSoc       float64 // 0 at min soc, 1 at max soc
 	overcharged     float64 // 0 up to max soc, 1 at 100%
 	undercharged    float64 // 0 down to min soc, 1 at 0%
 	usableCapacity  float64 // kWh between min and max soc
-	full            bool    // must not charge
+	capacityAssumed bool
+	pv              float64 // own pv passing through the AC side, NaN if unknown
 	minAC           float64
 	maxAC           float64
-	preferred       float64 // power fed in by itself
+	limitsAssumed   bool
+	minPower        float64 // the inverter stops below
+	running         bool    // the inverter runs with the last setpoint
 }
 
-// assumeCapacities sets unknown capacities to the average of the known ones, or the default if none is known
-func assumeCapacities(bb []dispatchBattery) {
+// newDispatchBattery prepares a battery with soc for the dispatch. defaultCapacity is used if the capacity
+// is unknown, limits of 0 are unknown. Self-regulating batteries charge from their own pv only, which is
+// unknown per battery (NaN) and added for all of them together by sumRegulating.
+func newDispatchBattery(m types.Measurement, mode api.BatteryMode, defaultCapacity, maxCharge, maxDischarge float64, controlled bool, pv float64) dispatchBattery {
+	b := dispatchBattery{name: m.Title, controlled: controlled, mode: mode, pv: pv}
+	if b.name == "" {
+		b.name = m.Name
+	}
+
+	soc, minSoc, maxSoc := *m.Soc, 0.0, 100.0
+	if m.MinSoc != nil && m.MaxSoc != nil && *m.MinSoc < *m.MaxSoc {
+		minSoc, maxSoc = *m.MinSoc, *m.MaxSoc
+	}
+
+	b.scaledSoc = (soc - minSoc) / (maxSoc - minSoc)
+
+	switch {
+	case soc >= 100:
+		b.overcharged = 1
+	case soc > maxSoc:
+		b.overcharged = (soc - maxSoc) / (100 - maxSoc)
+	}
+	switch {
+	case soc <= 0:
+		b.undercharged = 1
+	case soc < minSoc:
+		b.undercharged = (minSoc - soc) / minSoc
+	}
+
+	capacity := defaultCapacity
+	if m.Capacity != nil && *m.Capacity > 0 {
+		capacity = *m.Capacity
+	} else {
+		b.capacityAssumed = true
+	}
+	b.usableCapacity = capacity * (maxSoc - minSoc) / 100
+
+	if maxCharge <= 0 || maxDischarge <= 0 {
+		b.limitsAssumed = true
+		if maxCharge <= 0 {
+			maxCharge = dispatchDefaultPower
+		}
+		if maxDischarge <= 0 {
+			maxDischarge = dispatchDefaultPower
+		}
+	}
+
+	canDischarge := mode != api.BatteryHoldDischarge && b.scaledSoc > 0
+
+	switch {
+	case !controlled && canDischarge:
+		b.maxAC = maxDischarge
+
+	case controlled:
+		// a battery that must not discharge or charge passes its own pv through.
+		// Above max soc it discharges in addition: a full battery curtails its pv and reads it too low.
+		b.maxAC = maxDischarge
+		if !canDischarge {
+			b.maxAC = min(pv, maxDischarge)
+		}
+
+		b.minAC = -maxCharge
+		if !b.canCharge() {
+			b.minAC = min(b.maxAC, pv+b.overcharged*maxDischarge)
+		}
+	}
+
+	return b
+}
+
+// canCharge returns if mode and soc allow charging
+func (b dispatchBattery) canCharge() bool {
+	return b.mode != api.BatteryHoldCharge && b.scaledSoc < 1
+}
+
+// preferred returns the power the battery feeds in by itself: its own pv within its limits
+func (b dispatchBattery) preferred() float64 {
+	return max(b.minAC, min(b.maxAC, b.pv))
+}
+
+// averageCapacity returns the average of the known capacities, or the default if none is known
+func averageCapacity(mm []types.Measurement) float64 {
 	var sum float64
 	var known int
-	for _, b := range bb {
-		if b.capacity > 0 {
-			sum += b.capacity
+	for _, m := range mm {
+		if m.Capacity != nil && *m.Capacity > 0 {
+			sum += *m.Capacity
 			known++
 		}
 	}
 
-	assumed := float64(dispatchDefaultCapacity)
-	if known > 0 {
-		assumed = sum / float64(known)
+	if known == 0 {
+		return dispatchDefaultCapacity
 	}
-
-	for i := range bb {
-		if bb[i].capacity <= 0 {
-			bb[i].capacity = assumed
-			bb[i].capacityAssumed = true
-		}
-	}
+	return sum / float64(known)
 }
 
-// prepare derives the dispatch values from the input
-func (b *dispatchBattery) prepare() {
-	if b.maxSoc <= b.minSoc {
-		b.minSoc, b.maxSoc = 0, 100
-	}
-
-	b.scaledSoc = (b.soc - b.minSoc) / (b.maxSoc - b.minSoc)
-	b.usableCapacity = b.capacity * (b.maxSoc - b.minSoc) / 100
-
-	switch {
-	case b.soc >= 100:
-		b.overcharged = 1
-	case b.soc > b.maxSoc:
-		b.overcharged = (b.soc - b.maxSoc) / (100 - b.maxSoc)
-	}
-	switch {
-	case b.soc <= 0:
-		b.undercharged = 1
-	case b.soc < b.minSoc:
-		b.undercharged = (b.minSoc - b.soc) / b.minSoc
-	}
-
-	if b.maxCharge <= 0 || b.maxDischarge <= 0 {
-		b.limitsAssumed = true
-		if b.maxCharge <= 0 {
-			b.maxCharge = dispatchDefaultPower
-		}
-		if b.maxDischarge <= 0 {
-			b.maxDischarge = dispatchDefaultPower
-		}
-	}
-
-	b.full = b.mode == api.BatteryHoldCharge || b.scaledSoc >= 1
-	empty := b.mode == api.BatteryHoldDischarge || b.scaledSoc <= 0
-
-	if !b.controlled {
-		// self-regulating batteries charge from their own pv only, which is added for all of them together
-		if !empty {
-			b.maxAC = b.maxDischarge
-		}
-		return
-	}
-
-	// a battery that must not discharge or charge passes its own pv through.
-	// Above max soc it discharges in addition: a full battery curtails its pv and reads it too low.
-	b.maxAC = b.maxDischarge
-	if empty {
-		b.maxAC = min(b.pv, b.maxDischarge)
-	}
-
-	b.preferred = min(b.maxAC, b.pv+b.overcharged*b.maxDischarge)
-
-	b.minAC = -b.maxCharge
-	if b.full {
-		b.minAC = b.preferred
-	}
-}
-
-// sumRegulating sums up the prepared self-regulating batteries, they cannot be controlled individually.
+// sumRegulating sums up the self-regulating batteries, they cannot be controlled individually.
 // pv is their pv, which is passed through if none of them can charge.
 func sumRegulating(bb []dispatchBattery, pv float64) dispatchBattery {
-	res := dispatchBattery{name: "self-regulating", pv: pv, full: true}
+	res := dispatchBattery{name: "self-regulating", pv: pv, maxAC: pv}
 
+	full := true
 	for _, b := range bb {
 		res.usableCapacity += b.usableCapacity
 		res.scaledSoc += b.scaledSoc * b.usableCapacity
 		res.overcharged += b.overcharged * b.usableCapacity
 		res.undercharged += b.undercharged * b.usableCapacity
 		res.maxAC += b.maxAC
-		res.full = res.full && b.full
 		res.capacityAssumed = res.capacityAssumed || b.capacityAssumed
 		res.limitsAssumed = res.limitsAssumed || b.limitsAssumed
+		full = full && !b.canCharge()
 	}
 
 	res.scaledSoc /= res.usableCapacity
 	res.overcharged /= res.usableCapacity
 	res.undercharged /= res.usableCapacity
 
-	res.maxAC += pv
-	res.preferred = pv
-	if res.full {
+	if full {
 		res.minAC = pv
 	}
 
@@ -179,21 +183,21 @@ func dispatchTable(bb []dispatchBattery) string {
 
 	var sb strings.Builder
 	w := tabwriter.NewWriter(&sb, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "battery\tmode\tsoc %\tscaled\tover\tunder\tcapacity kWh\tpv W\tmin W\tmax W\tpreferred W\t")
+	fmt.Fprintln(w, "battery\tmode\tscaled soc\tover\tunder\tcapacity kWh\tpv W\tmin W\tmax W\t")
 
 	for _, b := range bb {
-		mode, soc, pv := "", "", fmt.Sprintf("%.0f", b.pv)
-		if b.name != "self-regulating" {
-			mode, soc = b.mode.String(), fmt.Sprintf("%.0f", b.soc)
-			if !b.controlled {
-				pv = "*"
-			}
+		mode, pv := "", "*"
+		if b.mode != api.BatteryUnknown {
+			mode = b.mode.String()
+		}
+		if !math.IsNaN(b.pv) {
+			pv = fmt.Sprintf("%.0f", b.pv)
 		}
 
-		fmt.Fprintf(w, "%s\t%s\t%s\t%.2f\t%.2f\t%.2f\t%s\t%s\t%s\t%s\t%.0f\t\n",
-			b.name, mode, soc, b.scaledSoc, b.overcharged, b.undercharged,
+		fmt.Fprintf(w, "%s\t%s\t%.2f\t%.2f\t%.2f\t%s\t%s\t%s\t%s\t\n",
+			b.name, mode, b.scaledSoc, b.overcharged, b.undercharged,
 			assumed("%.1f", b.usableCapacity, b.capacityAssumed), pv,
-			assumed("%.0f", b.minAC, b.limitsAssumed), assumed("%.0f", b.maxAC, b.limitsAssumed), b.preferred)
+			assumed("%.0f", b.minAC, b.limitsAssumed), assumed("%.0f", b.maxAC, b.limitsAssumed))
 	}
 
 	w.Flush()
@@ -259,7 +263,7 @@ func distributeBatteryPower(bb []dispatchBattery, stopped []bool, total float64)
 		if stopped[i] {
 			continue
 		}
-		ac[i] = b.preferred
+		ac[i] = b.preferred()
 		diff -= ac[i]
 		free = append(free, i)
 	}
@@ -353,9 +357,15 @@ func (site *Site) dispatchBatteries() {
 		return
 	}
 
-	var bb []dispatchBattery
-	ctrls := make(map[int]api.BatteryPowerController)
-	devs := make(map[int]config.Device[api.Meter])
+	defaultCapacity := averageCapacity(devices)
+
+	// controlled batteries first, the self-regulating ones summed up last
+	var dispatched, regulating []dispatchBattery
+	var ctrls []api.BatteryPowerController
+	var devs []config.Device[api.Meter]
+
+	// pv not reported by a controlled battery belongs to the self-regulating ones
+	regulatingPv := max(0, state.pvPower)
 
 	for i, dev := range site.batteryMeters {
 		meter := dev.Instance()
@@ -371,72 +381,46 @@ func (site *Site) dispatchBatteries() {
 			continue
 		}
 
-		b := dispatchBattery{name: deviceTitleOrName(dev), mode: mode, soc: *m.Soc, maxSoc: 100}
-		if m.MinSoc != nil {
-			b.minSoc = *m.MinSoc
-		}
-		if m.MaxSoc != nil {
-			b.maxSoc = *m.MaxSoc
-		}
-		if m.Capacity != nil {
-			b.capacity = *m.Capacity
-		}
-
+		var maxCharge, maxDischarge float64
 		if bpl, ok := api.Cap[api.BatteryPowerLimiter](meter); ok {
 			if c, d, err := bpl.GetPowerLimits(); err == nil {
-				b.maxCharge, b.maxDischarge = c, d
+				maxCharge, maxDischarge = c, d
 			}
 		}
 
-		if ctrl, ok := api.Cap[api.BatteryPowerController](meter); ok {
-			// without its pv the AC setpoint is unknown, the device keeps its last setpoint
-			pv, err := ctrl.BatteryPvPower()
-			if err != nil {
-				site.log.ERROR.Printf("battery %s pv power: %v", b.name, err)
-				continue
-			}
-
-			b.controlled = true
-			b.pv = max(0, pv)
-			b.minPower = ctrl.MinBatteryPower()
-			b.running = site.batteryRunning[dev.Config().Name]
-
-			ctrls[len(bb)] = ctrl
-			devs[len(bb)] = dev
+		ctrl, ok := api.Cap[api.BatteryPowerController](meter)
+		if !ok {
+			regulating = append(regulating, newDispatchBattery(m, mode, defaultCapacity, maxCharge, maxDischarge, false, math.NaN()))
+			continue
 		}
 
-		bb = append(bb, b)
+		// without its pv the AC setpoint is unknown, the device keeps its last setpoint
+		pv, err := ctrl.BatteryPvPower()
+		if err != nil {
+			site.log.ERROR.Printf("battery %s pv power: %v", deviceTitleOrName(dev), err)
+			continue
+		}
+		pv = max(0, pv)
+		regulatingPv -= pv
+
+		b := newDispatchBattery(m, mode, defaultCapacity, maxCharge, maxDischarge, true, pv)
+		b.minPower = ctrl.MinBatteryPower()
+		b.running = site.batteryRunning[dev.Config().Name]
+
+		dispatched = append(dispatched, b)
+		ctrls = append(ctrls, ctrl)
+		devs = append(devs, dev)
 	}
 
 	if len(ctrls) == 0 {
 		return
 	}
 
-	assumeCapacities(bb)
-
-	// controlled batteries first, the self-regulating ones summed up last
-	var dispatched, regulating []dispatchBattery
-	var idx []int
-
-	// pv not reported by a controlled battery belongs to the self-regulating ones
-	regulatingPv := max(0, state.pvPower)
-
-	for i := range bb {
-		bb[i].prepare()
-		if bb[i].controlled {
-			dispatched = append(dispatched, bb[i])
-			idx = append(idx, i)
-			regulatingPv -= bb[i].pv
-		} else {
-			regulating = append(regulating, bb[i])
-		}
-	}
-
-	rows := bb
+	rows := append(slices.Clone(dispatched), regulating...)
 	if len(regulating) > 0 {
 		sum := sumRegulating(regulating, max(0, regulatingPv))
 		dispatched = append(dispatched, sum)
-		rows = append(slices.Clone(bb), sum)
+		rows = append(rows, sum)
 	}
 
 	site.log.TRACE.Printf("battery dispatch:\n%s", dispatchTable(rows))
@@ -444,11 +428,11 @@ func (site *Site) dispatchBatteries() {
 	demand := site.dispatchDemand()
 	ac := dispatchBatteryPower(dispatched, demand)
 
-	// setpoints for the controlled batteries, which come first
-	for k, i := range idx {
-		b, p := bb[i], ac[k]
+	// the controlled batteries come first
+	for i, ctrl := range ctrls {
+		b, p := dispatched[i], ac[i]
 
-		if err := ctrls[i].SetBatteryPower(p); err != nil {
+		if err := ctrl.SetBatteryPower(p); err != nil {
 			if !errors.Is(err, api.ErrNotAvailable) {
 				site.log.ERROR.Printf("battery %s power: %v", b.name, err)
 			}
