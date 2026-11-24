@@ -69,7 +69,7 @@ func (b dispatchBattery) forced() bool {
 	return b.mode == api.BatteryCharge || b.mode == api.BatteryDischarge
 }
 
-// limits returns the AC power range the device limits, mode and soc allow
+// limits returns the AC power range the device limits, mode and soc allow, infinite if unlimited
 func (b dispatchBattery) limits() (float64, float64) {
 	lo, hi := math.Inf(-1), math.Inf(1)
 	if b.maxCharge > 0 {
