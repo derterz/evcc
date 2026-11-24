@@ -1,6 +1,7 @@
 package core
 
 import (
+	"math"
 	"slices"
 	"testing"
 	"time"
@@ -187,6 +188,16 @@ func TestNewDispatchBattery(t *testing.T) {
 func TestAverageCapacity(t *testing.T) {
 	assert.Equal(t, 5.0, averageCapacity([]types.Measurement{measurement(50, 0, 100, 0), measurement(50, 0, 100, 4), measurement(50, 0, 100, 6)}))
 	assert.Equal(t, 1.0, averageCapacity([]types.Measurement{measurement(50, 0, 100, 0)}))
+	assert.Equal(t, 4.0, averageCapacity([]types.Measurement{measurement(50, 0, 100, math.NaN()), measurement(50, 0, 100, math.Inf(1)), measurement(50, 0, 100, 4)}))
+}
+
+func TestNewDispatchBatteryInvalidValues(t *testing.T) {
+	// invalid soc limits fall back to 0..100, an invalid capacity is assumed
+	m := types.Measurement{Soc: new(50.0), MinSoc: new(math.NaN()), MaxSoc: new(90.0), Capacity: new(math.Inf(1))}
+	b := newDispatchBattery(m, api.BatteryNormal, 3, 1500, 800, 0)
+	assert.Equal(t, 0.5, b.scaledSoc)
+	assert.True(t, b.capacityAssumed)
+	assert.Equal(t, 3.0, b.usableCapacity)
 }
 
 func TestSumRegulating(t *testing.T) {
@@ -237,8 +248,14 @@ func TestDispatchDemand(t *testing.T) {
 
 	assert.Zero(t, (&Site{}).dispatchDemand())
 
+	// invalid samples are not recorded
+	site := &Site{}
+	site.recordDemand(time.Now(), math.NaN())
+	site.recordDemand(time.Now(), math.Inf(-1))
+	assert.Empty(t, site.demandWindow)
+
 	// samples older than the window are dropped
-	site := record(900, 300, 2500, 400, 350, 800, 600, 500, 700, 450, 3000, 650)
+	site = record(900, 300, 2500, 400, 350, 800, 600, 500, 700, 450, 3000, 650)
 	assert.Len(t, site.demandWindow, 11)
 
 	// deficit: low percentile, short load peaks do not raise it

@@ -55,7 +55,7 @@ func newDispatchBattery(m types.Measurement, mode api.BatteryMode, defaultCapaci
 	}
 
 	soc, minSoc, maxSoc := *m.Soc, 0.0, 100.0
-	if m.MinSoc != nil && m.MaxSoc != nil && *m.MinSoc < *m.MaxSoc {
+	if m.MinSoc != nil && m.MaxSoc != nil && isFinite(*m.MinSoc) && isFinite(*m.MaxSoc) && *m.MinSoc < *m.MaxSoc {
 		minSoc, maxSoc = *m.MinSoc, *m.MaxSoc
 	}
 
@@ -95,10 +95,15 @@ func newDispatchBattery(m types.Measurement, mode api.BatteryMode, defaultCapaci
 
 // measuredCapacity returns the battery's capacity, or defaultCapacity if unknown
 func measuredCapacity(m types.Measurement, defaultCapacity float64) (float64, bool) {
-	if m.Capacity != nil && *m.Capacity > 0 {
+	if m.Capacity != nil && isFinite(*m.Capacity) && *m.Capacity > 0 {
 		return *m.Capacity, true
 	}
 	return defaultCapacity, false
+}
+
+// isFinite returns if f is neither NaN nor infinite
+func isFinite(f float64) bool {
+	return !math.IsNaN(f) && !math.IsInf(f, 0)
 }
 
 // preferred returns the power the battery feeds in by itself: its own pv within its limits
@@ -111,8 +116,8 @@ func averageCapacity(mm []types.Measurement) float64 {
 	var sum float64
 	var known int
 	for _, m := range mm {
-		if m.Capacity != nil && *m.Capacity > 0 {
-			sum += *m.Capacity
+		if c, ok := measuredCapacity(m, 0); ok {
+			sum += c
 			known++
 		}
 	}
@@ -287,6 +292,10 @@ type demandSample struct {
 
 // recordDemand adds a sample of the demand the batteries cover together to the dispatch window
 func (site *Site) recordDemand(now time.Time, power float64) {
+	if !isFinite(power) {
+		return
+	}
+
 	site.demandWindow = append(site.demandWindow, demandSample{now, power})
 	site.demandWindow = slices.DeleteFunc(site.demandWindow, func(s demandSample) bool {
 		return now.Sub(s.ts) > dispatchWindow
@@ -336,7 +345,10 @@ func (site *Site) dispatchBatteries() {
 	var devs []config.Device[api.Meter]
 
 	// pv not reported by a controlled battery belongs to the self-regulating ones
-	regulatingPv := max(0, state.pvPower)
+	var regulatingPv float64
+	if isFinite(state.pvPower) {
+		regulatingPv = max(0, state.pvPower)
+	}
 
 	type regulatingInput struct {
 		m             types.Measurement
@@ -356,14 +368,14 @@ func (site *Site) dispatchBatteries() {
 		}
 
 		// without soc nothing can be balanced, a forced mode owns the device
-		if m.Soc == nil || mode == api.BatteryCharge || mode == api.BatteryDischarge {
+		if m.Soc == nil || !isFinite(*m.Soc) || mode == api.BatteryCharge || mode == api.BatteryDischarge {
 			continue
 		}
 
 		maxCharge, maxDischarge := float64(dispatchDefaultPower), float64(dispatchDefaultPower)
 		var limitsKnown bool
 		if bpl, ok := api.Cap[api.BatteryPowerLimiter](meter); ok {
-			if c, d, err := bpl.GetPowerLimits(); err == nil && c > 0 && d > 0 {
+			if c, d, err := bpl.GetPowerLimits(); err == nil && isFinite(c) && isFinite(d) && c > 0 && d > 0 {
 				maxCharge, maxDischarge, limitsKnown = c, d, true
 			}
 		}
@@ -376,11 +388,13 @@ func (site *Site) dispatchBatteries() {
 		}
 
 		var pv float64
-		if p, err := ctrl.BatteryPvPower(); err == nil {
+		if p, err := ctrl.BatteryPvPower(); err != nil {
+			site.log.ERROR.Printf("battery %s pv power: %v", deviceTitleOrName(dev), err)
+		} else if !isFinite(p) {
+			site.log.ERROR.Printf("battery %s pv power: invalid value %v", deviceTitleOrName(dev), p)
+		} else {
 			pv = max(0, p)
 			regulatingPv -= pv
-		} else {
-			site.log.ERROR.Printf("battery %s pv power: %v", deviceTitleOrName(dev), err)
 		}
 
 		b := newDispatchBattery(m, mode, defaultCapacity, maxCharge, maxDischarge, pv)
