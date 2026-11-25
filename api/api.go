@@ -89,6 +89,14 @@ type BatteryController interface {
 	SetBatteryMode(BatteryMode) error
 }
 
+// BatteryPowerController sets the AC power in W, positive = discharge.
+// A device with its own PV passes it through the AC side, the battery power is the AC power minus that PV.
+type BatteryPowerController interface {
+	SetBatteryPower(power float64) error
+	BatteryPvPower() (float64, error) // own PV power, 0 if none
+	MinBatteryPower() float64         // below this the device stops instead
+}
+
 // Charger provides current charging status and enable/disable charging
 type Charger interface {
 	ChargeState
