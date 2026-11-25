@@ -1,8 +1,57 @@
+{{- define "marstek-batterymode-evcc" }}
+    set:
+      source: sequence
+      set:
+      # Restore Max Charge Power
+      - source: const
+        value: {{ .maxchargepower }}
+        set:
+          source: modbus
+          {{- include "modbus" . | indent 10 }}
+          register:
+            address: 44002 # Max Charge Power
+            type: writesingle
+            decode: uint16
+      # Restore Max Discharge Power, also needed to pass own PV through in holddischarge
+      - source: const
+        value: {{ .maxdischargepower }}
+        set:
+          source: modbus
+          {{- include "modbus" . | indent 10 }}
+          register:
+            address: 44003 # Max Discharge Power
+            type: writesingle
+            decode: uint16
+      # Enable RS485 Control Mode, evcc sets the power each cycle
+      - source: const
+        value: 21930
+        set:
+          source: modbus
+          {{- include "modbus" . | indent 10 }}
+          register:
+            address: 42000 # RS485 Control Mode = Enabled
+            type: writesingle
+            decode: uint16
+      # Stop until the next power setpoint
+      - source: const
+        value: 0
+        set:
+          source: modbus
+          {{- include "modbus" . | indent 10 }}
+          register:
+            address: 42010 # Force Charge/Discharge = Stop
+            type: writesingle
+            decode: uint16
+{{- end }}
+
 {{- define "marstek-batterymode" }}
 batterymode:
   source: switch
   switch:
   - case: 1 # normal
+    {{- if eq (toString .work_mode_normal) "evcc" }}
+    {{- include "marstek-batterymode-evcc" . }}
+    {{- else }}
     set:
       source: sequence
       set:
@@ -56,7 +105,11 @@ batterymode:
             address: 42000 # RS485 Control Mode = Disabled
             type: writesingle
             decode: uint16
+    {{- end }}
   - case: 2 # holddischarge -> no discharging, charging allowed
+    {{- if eq (toString .work_mode_normal) "evcc" }}
+    {{- include "marstek-batterymode-evcc" . }}
+    {{- else }}
     set:
       source: sequence
       set:
@@ -110,6 +163,7 @@ batterymode:
             address: 42000 # RS485 Control Mode = Disabled
             type: writesingle
             decode: uint16
+    {{- end }}
   - case: 3 # charge
     set:
       source: sequence
@@ -156,6 +210,9 @@ batterymode:
             decode: uint16
   # Do not disable RS485 Control Mode because it will reset the device and let it charge/discharge again
   - case: 4 # holdcharge -> no charging, discharging allowed
+    {{- if eq (toString .work_mode_normal) "evcc" }}
+    {{- include "marstek-batterymode-evcc" . }}
+    {{- else }}
     set:
       source: sequence
       set:
@@ -209,6 +266,7 @@ batterymode:
             address: 42000 # RS485 Control Mode = Disabled
             type: writesingle
             decode: uint16
+    {{- end }}
   # Do not disable RS485 Control Mode because it will reset the device and let it charge/discharge again
   - case: 5 # discharge -> forced discharge to grid (feed-in arbitrage)
     set:

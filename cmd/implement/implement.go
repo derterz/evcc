@@ -66,6 +66,7 @@ func generate(out io.Writer) error {
 		reflect.TypeFor[api.BatteryCapacity](),
 		reflect.TypeFor[api.BatteryController](),
 		reflect.TypeFor[api.BatteryPowerLimiter](),
+		reflect.TypeFor[api.BatteryPowerController](),
 		reflect.TypeFor[api.BatterySocLimiter](),
 		reflect.TypeFor[api.ChargeController](),
 		reflect.TypeFor[api.ChargeRater](),
