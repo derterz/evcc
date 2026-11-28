@@ -30,9 +30,9 @@ func measurement(soc, minSoc, maxSoc, capacity float64) types.Measurement {
 func TestDispatchBatteryPower(t *testing.T) {
 	normal := api.BatteryNormal
 
-	// the uncontrolled battery's pv passes the inverter in addition to its discharge
+	// the uncontrolled battery charges from its own pv only
 	uncontrolled := func(soc, pv float64) dispatchBattery {
-		return newDispatchBattery(testLog, measurement(soc, 10, 100, 10), normal, 10, 0, 5000+pv, pv)
+		return newDispatchBattery(testLog, measurement(soc, 10, 100, 10), normal, 10, 0, 5000, pv)
 	}
 	controlled := func(soc, pv float64, mode api.BatteryMode) dispatchBattery {
 		return newDispatchBattery(testLog, measurement(soc, 10, 100, 5), mode, 5, 1500, 800, pv)
@@ -310,7 +310,7 @@ func TestDispatchBatteries(t *testing.T) {
 		}
 		site.batteryMeters = []config.Device[api.Meter]{
 			config.NewStaticDevice[api.Meter](config.Named{Name: "ctrl"}, ctrl),
-			config.NewStaticDevice[api.Meter](config.Named{Name: "uncontrolled"}, &mockBatteryPowerLimiter{Meter: &mockMeter{}, discharge: 5000}),
+			config.NewStaticDevice[api.Meter](config.Named{Name: "uncontrolled"}, &mockBatteryPowerLimiter{Meter: &mockMeter{}, charge: 5000, discharge: 5000}),
 			config.NewStaticDevice[api.Meter](config.Named{Name: "unknown"}, &mockMeter{}),
 			config.NewStaticDevice[api.Meter](config.Named{Name: "nosoc"}, noSoc),
 			config.NewStaticDevice[api.Meter](config.Named{Name: "forced"}, forced),

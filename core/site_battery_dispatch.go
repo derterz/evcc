@@ -462,8 +462,8 @@ func (site *Site) applyBatteryDispatch(now time.Time) map[string]bool {
 			}
 
 			if ctrls[i] == nil {
-				// uncontrolled batteries charge from their own pv only, which passes the inverter on top of the discharge
-				maxCharge, maxDischarge = 0, maxDischarge+pv
+				// uncontrolled batteries charge from their own pv only, the discharge limit caps the inverter's AC output including that pv
+				maxCharge = 0
 			}
 
 			b = newDispatchBattery(site.log, m, mode, capacity, maxCharge, maxDischarge, pv)
