@@ -14,14 +14,12 @@ import (
 )
 
 const (
-	// dispatchWindow is the demand history the dispatched power is derived from
-	dispatchWindow = 5 * time.Minute
-	// dispatchPercentile of demand within the window, so short peaks neither cause export nor import
+	// dispatchWindow is the consumption history the dispatched power is derived from
+	dispatchWindow = 10 * time.Minute
+	// dispatchPercentile of consumption within the window, low and high, so short peaks neither cause export nor import
 	dispatchPercentile = 0.1
 	// dispatchBalanceSpread is the scaled soc difference at which balancing reaches full effect
 	dispatchBalanceSpread = 0.1
-	// dispatchStartFactor of min power a stopped inverter needs to start, hysteresis against toggling
-	dispatchStartFactor = 1.5
 	// dispatchDefaultPower is the inverter charge and discharge limit in W assumed if unknown
 	dispatchDefaultPower = 800
 	// dispatchDefaultCapacity is the capacity in kWh assumed if no battery's capacity is known
@@ -33,23 +31,18 @@ type dispatchBattery struct {
 	name           string
 	mode           api.BatteryMode
 	scaledSoc      float64 // 0 at min soc, 1 at max soc
-	overcharged    float64 // 0 up to max soc, 1 at 100%
-	undercharged   float64 // 0 down to min soc, 1 at 0%
 	usableCapacity float64 // kWh between min and max soc
 	pv             float64 // own pv passing through the AC side
+	targetCharge   float64 // charge below min soc, negative = discharge above max soc, exchanged with the grid instead of the other batteries
 	minAC          float64
 	maxAC          float64
 	minPower       float64 // the inverter stops below
-	running        bool    // the inverter runs with the last setpoint
 }
 
 // newDispatchBattery prepares a battery with soc for the dispatch.
 // maxCharge is the AC charge limit, 0 if the battery charges from its own pv only.
 func newDispatchBattery(log *util.Logger, m types.Measurement, mode api.BatteryMode, capacity, maxCharge, maxDischarge, pv float64) dispatchBattery {
-	b := dispatchBattery{name: m.Title, mode: mode, pv: pv}
-	if b.name == "" {
-		b.name = m.Name
-	}
+	b := dispatchBattery{name: measurementName(m), mode: mode, pv: pv}
 
 	soc, minSoc, maxSoc := *m.Soc, 0.0, 100.0
 	if m.MinSoc != nil && m.MaxSoc != nil && isFinite(*m.MinSoc) && isFinite(*m.MaxSoc) && *m.MinSoc < *m.MaxSoc {
@@ -61,39 +54,58 @@ func newDispatchBattery(log *util.Logger, m types.Measurement, mode api.BatteryM
 	b.scaledSoc = (soc - minSoc) / (maxSoc - minSoc)
 	b.usableCapacity = capacity * (maxSoc - minSoc) / 100
 
-	switch {
-	case soc >= 100:
-		b.overcharged = 1
-	case soc > maxSoc:
-		b.overcharged = (soc - maxSoc) / (100 - maxSoc)
-	}
+	// below min soc charging protects the battery, above max soc discharging keeps a curtailing battery's pv reading right
+	var charge, discharge float64
 	switch {
 	case soc <= 0:
-		b.undercharged = 1
+		charge = maxCharge
 	case soc < minSoc:
-		b.undercharged = (minSoc - soc) / minSoc
+		charge = maxCharge * (minSoc - soc) / minSoc
 	}
+	switch {
+	case soc >= 100:
+		discharge = maxDischarge
+	case soc > maxSoc:
+		discharge = maxDischarge * (soc - maxSoc) / (100 - maxSoc)
+	}
+	b.targetCharge = charge - discharge
+	target := pv - b.targetCharge
 
-	// below min soc charging protects the battery, above max soc discharging keeps a curtailing battery's pv reading right
 	b.minAC, b.maxAC = -maxCharge, maxDischarge
-
 	if mode == api.BatteryHoldDischarge || b.scaledSoc <= 0 {
-		charge := b.undercharged * maxCharge
-		if mode == api.BatteryHoldCharge {
-			charge = 0
-		}
-		b.maxAC = min(maxDischarge, pv-charge)
+		b.maxAC = min(maxDischarge, target)
+	}
+	if mode == api.BatteryHoldCharge || b.scaledSoc >= 1 {
+		b.minAC = max(-maxCharge, min(b.maxAC, target))
 	}
 
-	if mode == api.BatteryHoldCharge || b.scaledSoc >= 1 {
-		discharge := b.overcharged * maxDischarge
-		if mode == api.BatteryHoldDischarge {
-			discharge = 0
-		}
-		b.minAC = max(-maxCharge, min(b.maxAC, pv+discharge))
-	}
+	// only what is reachable within the limits, beyond the pv the battery passes anyway
+	b.targetCharge = max(-maxCharge, min(maxDischarge, pv)) - b.preferred()
 
 	return b
+}
+
+// pinnedDispatchBattery prepares a battery fixed at ac, its soc only takes part in the balancing if known
+func pinnedDispatchBattery(log *util.Logger, m types.Measurement, mode api.BatteryMode, capacity, pv, ac float64) dispatchBattery {
+	b := dispatchBattery{name: measurementName(m), mode: mode, pv: pv}
+	if hasSoc(m) {
+		b = newDispatchBattery(log, m, mode, capacity, 0, 0, pv)
+	}
+	b.minAC, b.maxAC, b.targetCharge = ac, ac, 0
+	return b
+}
+
+// measurementName returns the battery's title or name
+func measurementName(m types.Measurement) string {
+	if m.Title != "" {
+		return m.Title
+	}
+	return m.Name
+}
+
+// hasSoc returns if the battery's soc is known
+func hasSoc(m types.Measurement) bool {
+	return m.Soc != nil && isFinite(*m.Soc)
 }
 
 // measuredCapacity returns the battery's capacity if known
@@ -109,43 +121,33 @@ func isFinite(f float64) bool {
 	return !math.IsNaN(f) && !math.IsInf(f, 0)
 }
 
-// preferred returns the power the battery feeds in by itself: its own pv within its limits
+// preferred returns the power the battery feeds in by itself: its own pv minus the target charge within its limits
 func (b dispatchBattery) preferred() float64 {
-	return max(b.minAC, min(b.maxAC, b.pv))
+	return max(b.minAC, min(b.maxAC, b.pv-b.targetCharge))
 }
 
 // String returns the dispatch values for logging
 func (b dispatchBattery) String() string {
-	return fmt.Sprintf("%s (%s): soc %.0f%% (over %.0f%%, under %.0f%%), capacity %.1fkWh, pv %.0fW, ac %.0f..%.0fW",
-		b.name, b.mode, 100*b.scaledSoc, 100*b.overcharged, 100*b.undercharged, b.usableCapacity, b.pv, b.minAC, b.maxAC)
+	return fmt.Sprintf("%s (%s): soc %.0f%%, capacity %.1fkWh, pv %.0fW, target charge %.0fW, ac %.0f..%.0fW",
+		b.name, b.mode, 100*b.scaledSoc, b.usableCapacity, b.pv, b.targetCharge, b.minAC, b.maxAC)
 }
 
-// dispatchBatteryPower returns the AC power per battery covering demand plus their own pv.
-// Inverters below start power are stopped one by one, their share goes to the others.
-func dispatchBatteryPower(bb []dispatchBattery, demand float64) []float64 {
-	total := demand
-	for _, b := range bb {
-		total += b.pv
-	}
-
+// dispatchBatteryPower returns the AC power per battery covering total.
+// Inverters below min power are stopped one by one, their share goes to the others.
+func dispatchBatteryPower(bb []dispatchBattery, total float64) []float64 {
 	stopped := make([]bool, len(bb))
 
 	for {
 		ac := distributeBatteryPower(bb, stopped, total)
 
-		// stop the battery furthest below its start power
+		// stop the battery furthest below its min power
 		worst, margin := -1, 0.0
 		for i, b := range bb {
 			if stopped[i] {
 				continue
 			}
 
-			start := b.minPower
-			if !b.running {
-				start *= dispatchStartFactor
-			}
-
-			if m := math.Abs(ac[i]) - start; worst < 0 || m < margin {
+			if m := math.Abs(ac[i]) - b.minPower; worst < 0 || m < margin {
 				worst, margin = i, m
 			}
 		}
@@ -177,7 +179,9 @@ func distributeBatteryPower(bb []dispatchBattery, stopped []bool, total float64)
 		}
 		ac[i] = b.preferred()
 		diff -= ac[i]
-		free = append(free, i)
+		if b.minAC < b.maxAC {
+			free = append(free, i)
+		}
 	}
 
 	// each round either distributes everything or pins at least one battery to its limit
@@ -221,88 +225,143 @@ func distributeBatteryPower(bb []dispatchBattery, stopped []bool, total float64)
 	return ac
 }
 
-type demandSample struct {
+type consumptionSample struct {
 	ts    time.Time
 	power float64
 }
 
-// recordDemand adds a sample of the demand the batteries cover together to the dispatch window
-func (site *Site) recordDemand(now time.Time, power float64) {
-	if !isFinite(power) {
+// recordConsumption adds a consumption sample to the dispatch window and drops samples older than the window
+func (site *Site) recordConsumption(now time.Time, power float64) {
+	if !isFinite(power) || power < 0 {
 		return
 	}
 
-	site.demandWindow = append(site.demandWindow, demandSample{now, power})
-	site.demandWindow = slices.DeleteFunc(site.demandWindow, func(s demandSample) bool {
+	site.consumptionWindow = append(site.consumptionWindow, consumptionSample{now, power})
+	site.pruneConsumption(now)
+}
+
+// pruneConsumption drops samples older than the window
+func (site *Site) pruneConsumption(now time.Time) {
+	site.consumptionWindow = slices.DeleteFunc(site.consumptionWindow, func(s consumptionSample) bool {
 		return now.Sub(s.ts) > dispatchWindow
 	})
 }
 
-// dispatchDemand returns the demand the batteries can cover without exporting or importing within the
-// window: the low percentile if it's a deficit, the high percentile if it's a surplus, else zero.
-func (site *Site) dispatchDemand() float64 {
-	if len(site.demandWindow) == 0 {
-		return 0
+// consumptionPercentiles returns the low and high percentile of consumption within the window
+func (site *Site) consumptionPercentiles() (float64, float64) {
+	if len(site.consumptionWindow) == 0 {
+		return 0, 0
 	}
 
-	vals := make([]float64, 0, len(site.demandWindow))
-	for _, s := range site.demandWindow {
+	vals := make([]float64, 0, len(site.consumptionWindow))
+	for _, s := range site.consumptionWindow {
 		vals = append(vals, s.power)
 	}
 	slices.Sort(vals)
 
 	n := float64(len(vals) - 1)
-	low := vals[int(math.Floor(dispatchPercentile*n))]
-	high := vals[int(math.Ceil((1-dispatchPercentile)*n))]
+	return vals[int(math.Floor(dispatchPercentile*n))], vals[int(math.Ceil((1-dispatchPercentile)*n))]
+}
+
+// dispatchTotal returns the AC power the batteries cover together for the low and high consumption.
+// Their target charge is exchanged with the grid. Beyond their preferred power they only discharge
+// if even the low consumption is a deficit and only charge if even the high consumption is a surplus.
+func dispatchTotal(bb []dispatchBattery, low, high float64) float64 {
+	var preferred, targetCharge float64
+	for _, b := range bb {
+		preferred += b.preferred()
+		targetCharge += b.targetCharge
+	}
 
 	switch {
-	case low > 0:
-		return low
-	case high < 0:
-		return high
+	case low-targetCharge > preferred:
+		return low - targetCharge
+	case high-targetCharge < preferred:
+		return high - targetCharge
 	default:
-		return 0
+		return preferred
 	}
 }
 
 // dispatchMode returns the battery's mode and if it takes part in the dispatch.
-// Without soc nothing can be balanced, a forced mode owns the device.
-func (site *Site) dispatchMode(dev config.Device[api.Meter], m types.Measurement) (api.BatteryMode, bool) {
+func (site *Site) dispatchMode(dev config.Device[api.Meter]) (api.BatteryMode, bool) {
 	mode := site.batteryModeApplied[dev.Config().Name]
 	if mode == api.BatteryUnknown {
 		mode = site.GetBatteryMode()
 	}
 
-	ok := m.Soc != nil && isFinite(*m.Soc) && mode != api.BatteryCharge && mode != api.BatteryDischarge
+	ok := mode != api.BatteryCharge && mode != api.BatteryDischarge
 	return mode, ok
 }
 
-// dispatchBatteries applies power setpoints to batteries that accept them
+// dispatchBatteries applies power setpoints to batteries that accept them and stops those that left the dispatch
 func (site *Site) dispatchBatteries() {
-	state := site.state()
-	devices := state.battery.Devices
-	if len(devices) != len(site.batteryMeters) {
-		return
+	site.releaseBatteries(site.applyBatteryDispatch(time.Now()))
+}
+
+// releaseBatteries stops batteries dispatched before but not anymore, unless a forced mode owns them now
+func (site *Site) releaseBatteries(dispatched map[string]bool) {
+	if dispatched == nil {
+		dispatched = make(map[string]bool)
 	}
 
-	// first pass: pv not measured by a controlled battery belongs to the self-regulating ones
-	ctrls := make([]api.BatteryPowerController, len(devices))
-	pvs := make([]float64, len(devices))
-
-	var regulatingPv float64
-	if isFinite(state.pvPower) {
-		regulatingPv = max(0, state.pvPower)
-	}
-
-	var knownCapacity, regulatingCapacity float64
-	var known, regulatingUnknown int
-	var controlled bool
-
-	for i, dev := range site.batteryMeters {
-		if _, ok := site.dispatchMode(dev, devices[i]); !ok {
+	for _, dev := range site.batteryMeters {
+		name := dev.Config().Name
+		if !site.batteryDispatched[name] || dispatched[name] {
 			continue
 		}
 
+		if _, ok := site.dispatchMode(dev); !ok {
+			continue
+		}
+
+		ctrl, ok := api.Cap[api.BatteryPowerController](dev.Instance())
+		if !ok {
+			continue
+		}
+
+		if err := ctrl.SetBatteryPower(0); err != nil && !errors.Is(err, api.ErrNotAvailable) {
+			site.log.ERROR.Printf("battery %s power: %v", deviceTitleOrName(dev), err)
+			// retry next cycle
+			dispatched[name] = true
+			continue
+		}
+
+		site.log.DEBUG.Printf("battery %s left the dispatch, stopped", deviceTitleOrName(dev))
+	}
+
+	site.batteryDispatched = dispatched
+}
+
+// applyBatteryDispatch applies power setpoints and returns the batteries it set
+func (site *Site) applyBatteryDispatch(now time.Time) map[string]bool {
+	state := site.state()
+	devices := state.battery.Devices
+	if len(devices) != len(site.batteryMeters) {
+		return nil
+	}
+
+	// without recent consumption, e.g. while meters fail, there is nothing to dispatch from
+	site.pruneConsumption(now)
+	if len(site.consumptionWindow) == 0 {
+		return nil
+	}
+
+	// first pass: pv not measured by a battery's own controller belongs to the uncontrolled ones
+	ctrls := make([]api.BatteryPowerController, len(devices))
+	pvs := make([]float64, len(devices))
+	measured := make([]bool, len(devices))
+
+	var additionalPv float64
+	if isFinite(state.pvPower) {
+		additionalPv = max(0, state.pvPower)
+	}
+
+	var knownCapacity, uncontrolledCapacity float64
+	var known, uncontrolledUnknown int
+	var foundControlled bool
+
+	for i, dev := range site.batteryMeters {
 		c, ok := measuredCapacity(devices[i])
 		if ok {
 			knownCapacity += c
@@ -312,36 +371,50 @@ func (site *Site) dispatchBatteries() {
 		ctrl, ok := api.Cap[api.BatteryPowerController](dev.Instance())
 		if !ok {
 			if c > 0 {
-				regulatingCapacity += c
+				uncontrolledCapacity += c
 			} else {
-				regulatingUnknown++
+				uncontrolledUnknown++
 			}
 			continue
 		}
 
-		ctrls[i] = ctrl
-		controlled = true
-
+		measured[i] = true
 		if p, err := ctrl.BatteryPvPower(); err != nil {
 			site.log.ERROR.Printf("battery %s pv power: %v", deviceTitleOrName(dev), err)
 		} else if !isFinite(p) {
 			site.log.ERROR.Printf("battery %s pv power: invalid value %v", deviceTitleOrName(dev), p)
 		} else {
 			pvs[i] = max(0, p)
-			regulatingPv -= pvs[i]
+			additionalPv -= pvs[i]
+		}
+
+		if _, ok := site.dispatchMode(dev); ok && hasSoc(devices[i]) {
+			ctrls[i] = ctrl
+			foundControlled = true
 		}
 	}
 
-	if !controlled {
-		return
+	if !foundControlled {
+		return nil
 	}
+
+	low, high := site.consumptionPercentiles()
 
 	defaultCapacity := float64(dispatchDefaultCapacity)
 	if known > 0 {
 		defaultCapacity = knownCapacity / float64(known)
 	}
-	regulatingCapacity += float64(regulatingUnknown) * defaultCapacity
-	regulatingPv = max(0, regulatingPv)
+	uncontrolledCapacity += float64(uncontrolledUnknown) * defaultCapacity
+	additionalPv = max(0, additionalPv)
+
+	var estimatedPvPerCapacity float64
+	if uncontrolledCapacity == 0 {
+		// no battery can pass this pv, so it comes from pv inverters without battery
+		low -= additionalPv
+		high -= additionalPv
+	} else {
+		estimatedPvPerCapacity = additionalPv / uncontrolledCapacity
+	}
 
 	// second pass: prepare all batteries alike
 	var bb []dispatchBattery
@@ -349,10 +422,7 @@ func (site *Site) dispatchBatteries() {
 
 	for i, dev := range site.batteryMeters {
 		m := devices[i]
-		mode, ok := site.dispatchMode(dev, m)
-		if !ok {
-			continue
-		}
+		mode, modeOk := site.dispatchMode(dev)
 
 		capacity, ok := measuredCapacity(m)
 		if !ok {
@@ -360,28 +430,46 @@ func (site *Site) dispatchBatteries() {
 			site.log.TRACE.Printf("battery %s dispatch: capacity unknown, assuming %.1fkWh", deviceTitleOrName(dev), capacity)
 		}
 
-		maxCharge, maxDischarge := float64(dispatchDefaultPower), float64(dispatchDefaultPower)
-		var limitsKnown bool
-		if bpl, ok := api.Cap[api.BatteryPowerLimiter](dev.Instance()); ok {
-			if c, d, err := bpl.GetPowerLimits(); err == nil && isFinite(c) && isFinite(d) && c > 0 && d > 0 {
-				maxCharge, maxDischarge, limitsKnown = c, d, true
-			}
-		}
-		if !limitsKnown {
-			site.log.TRACE.Printf("battery %s dispatch: power limits unknown, assuming %dW", deviceTitleOrName(dev), dispatchDefaultPower)
-		}
-
 		pv := pvs[i]
-		if ctrls[i] == nil {
-			// self-regulating batteries charge from their own pv only, which passes the inverter on top of the discharge
-			pv = regulatingPv * capacity / regulatingCapacity
-			maxCharge, maxDischarge = 0, maxDischarge+pv
+		if !measured[i] {
+			pv = estimatedPvPerCapacity * capacity
 		}
 
-		b := newDispatchBattery(site.log, m, mode, capacity, maxCharge, maxDischarge, pv)
-		if ctrls[i] != nil {
-			b.minPower = ctrls[i].MinBatteryPower()
-			b.running = site.batteryRunning[dev.Config().Name]
+		var b dispatchBattery
+		switch {
+		case !modeOk:
+			// a forced mode owns the device, the others take its current power as given
+			ac := pv
+			if isFinite(m.Power) {
+				ac += m.Power
+			}
+			b = pinnedDispatchBattery(site.log, m, mode, capacity, pv, ac)
+
+		case !hasSoc(m):
+			// nothing to balance, assumed to pass its pv through
+			b = pinnedDispatchBattery(site.log, m, mode, capacity, pv, pv)
+
+		default:
+			maxCharge, maxDischarge := float64(dispatchDefaultPower), float64(dispatchDefaultPower)
+			var limitsKnown bool
+			if bpl, ok := api.Cap[api.BatteryPowerLimiter](dev.Instance()); ok {
+				if c, d, err := bpl.GetPowerLimits(); err == nil && isFinite(c) && isFinite(d) && c > 0 && d > 0 {
+					maxCharge, maxDischarge, limitsKnown = c, d, true
+				}
+			}
+			if !limitsKnown {
+				site.log.TRACE.Printf("battery %s dispatch: power limits unknown, assuming %dW", deviceTitleOrName(dev), dispatchDefaultPower)
+			}
+
+			if ctrls[i] == nil {
+				// uncontrolled batteries charge from their own pv only, which passes the inverter on top of the discharge
+				maxCharge, maxDischarge = 0, maxDischarge+pv
+			}
+
+			b = newDispatchBattery(site.log, m, mode, capacity, maxCharge, maxDischarge, pv)
+			if ctrls[i] != nil {
+				b.minPower = ctrls[i].MinBatteryPower()
+			}
 		}
 
 		site.log.TRACE.Printf("battery dispatch: %v", b)
@@ -390,14 +478,20 @@ func (site *Site) dispatchBatteries() {
 		idx = append(idx, i)
 	}
 
-	demand := site.dispatchDemand()
+	// the uncontrolled batteries are not set, they take whatever is left
+	total := dispatchTotal(bb, low, high)
+	site.log.DEBUG.Printf("battery dispatch: consumption %.0f..%.0fW, total %.0fW", low, high, total)
 
-	// the self-regulating batteries are not set, they take whatever is left
-	for k, p := range dispatchBatteryPower(bb, demand) {
+	dispatched := make(map[string]bool)
+
+	for k, p := range dispatchBatteryPower(bb, total) {
 		i := idx[k]
 		if ctrls[i] == nil {
 			continue
 		}
+
+		// also after an error, so the battery is stopped once it leaves the dispatch
+		dispatched[site.batteryMeters[i].Config().Name] = true
 
 		if err := ctrls[i].SetBatteryPower(p); err != nil {
 			if !errors.Is(err, api.ErrNotAvailable) {
@@ -406,11 +500,8 @@ func (site *Site) dispatchBatteries() {
 			continue
 		}
 
-		if site.batteryRunning == nil {
-			site.batteryRunning = make(map[string]bool)
-		}
-		site.batteryRunning[site.batteryMeters[i].Config().Name] = p != 0
-
-		site.log.DEBUG.Printf("battery %s AC power setpoint: %.0fW (demand %.0fW)", bb[k].name, p, demand)
+		site.log.DEBUG.Printf("battery %s AC power setpoint: %.0fW", bb[k].name, p)
 	}
+
+	return dispatched
 }
