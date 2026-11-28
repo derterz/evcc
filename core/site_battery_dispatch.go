@@ -48,7 +48,7 @@ func newDispatchBattery(log *util.Logger, m types.Measurement, mode api.BatteryM
 	if m.MinSoc != nil && m.MaxSoc != nil && isFinite(*m.MinSoc) && isFinite(*m.MaxSoc) && *m.MinSoc < *m.MaxSoc {
 		minSoc, maxSoc = *m.MinSoc, *m.MaxSoc
 	} else {
-		log.TRACE.Printf("battery %s dispatch: soc limits unknown, assuming 0..100%%", b.name)
+		log.TRACE.Printf("battery dispatch: %s soc limits unknown, assuming 0..100%%", b.name)
 	}
 
 	b.scaledSoc = (soc - minSoc) / (maxSoc - minSoc)
@@ -321,13 +321,13 @@ func (site *Site) releaseBatteries(dispatched map[string]bool) {
 		}
 
 		if err := ctrl.SetBatteryPower(0); err != nil && !errors.Is(err, api.ErrNotAvailable) {
-			site.log.ERROR.Printf("battery %s power: %v", deviceTitleOrName(dev), err)
+			site.log.ERROR.Printf("battery dispatch: %s stop: %v", deviceTitleOrName(dev), err)
 			// retry next cycle
 			dispatched[name] = true
 			continue
 		}
 
-		site.log.DEBUG.Printf("battery %s left the dispatch, stopped", deviceTitleOrName(dev))
+		site.log.DEBUG.Printf("battery dispatch: %s left, stopped", deviceTitleOrName(dev))
 	}
 
 	site.batteryDispatched = dispatched
@@ -380,9 +380,9 @@ func (site *Site) applyBatteryDispatch(now time.Time) map[string]bool {
 
 		measured[i] = true
 		if p, err := ctrl.BatteryPvPower(); err != nil {
-			site.log.ERROR.Printf("battery %s pv power: %v", deviceTitleOrName(dev), err)
+			site.log.ERROR.Printf("battery dispatch: %s pv power: %v", deviceTitleOrName(dev), err)
 		} else if !isFinite(p) {
-			site.log.ERROR.Printf("battery %s pv power: invalid value %v", deviceTitleOrName(dev), p)
+			site.log.ERROR.Printf("battery dispatch: %s pv power: invalid value %v", deviceTitleOrName(dev), p)
 		} else {
 			pvs[i] = max(0, p)
 			additionalPv -= pvs[i]
@@ -427,7 +427,7 @@ func (site *Site) applyBatteryDispatch(now time.Time) map[string]bool {
 		capacity, ok := measuredCapacity(m)
 		if !ok {
 			capacity = defaultCapacity
-			site.log.TRACE.Printf("battery %s dispatch: capacity unknown, assuming %.1fkWh", deviceTitleOrName(dev), capacity)
+			site.log.TRACE.Printf("battery dispatch: %s capacity unknown, assuming %.1fkWh", deviceTitleOrName(dev), capacity)
 		}
 
 		pv := pvs[i]
@@ -458,7 +458,7 @@ func (site *Site) applyBatteryDispatch(now time.Time) map[string]bool {
 				}
 			}
 			if !limitsKnown {
-				site.log.TRACE.Printf("battery %s dispatch: power limits unknown, assuming %dW", deviceTitleOrName(dev), dispatchDefaultPower)
+				site.log.TRACE.Printf("battery dispatch: %s power limits unknown, assuming %dW", deviceTitleOrName(dev), dispatchDefaultPower)
 			}
 
 			if ctrls[i] == nil {
@@ -495,12 +495,12 @@ func (site *Site) applyBatteryDispatch(now time.Time) map[string]bool {
 
 		if err := ctrls[i].SetBatteryPower(p); err != nil {
 			if !errors.Is(err, api.ErrNotAvailable) {
-				site.log.ERROR.Printf("battery %s power: %v", bb[k].name, err)
+				site.log.ERROR.Printf("battery dispatch: %s setpoint: %v", bb[k].name, err)
 			}
 			continue
 		}
 
-		site.log.DEBUG.Printf("battery %s AC power setpoint: %.0fW", bb[k].name, p)
+		site.log.DEBUG.Printf("battery dispatch: %s AC power setpoint %.0fW", bb[k].name, p)
 	}
 
 	return dispatched
